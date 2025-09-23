@@ -1,120 +1,50 @@
-# -------------------------
-# Global / misc
-# -------------------------
-
-device: cpu
-
-# -------------------------
-# Encoder / codec config
-# -------------------------
-encoder:
-  compression: {type: zlib, level: 9}
-  min_block: 32
-  max_block: 128
-  block_size: 16           # (unused by RL path; min/max_block are used)
-  default_q: 12
-  default_K: 5
-  default_H: 8
-  num_workers: 8
-  chunk_size: 512
-  split: {var_thresh: 0.0025, grad_thresh: 0.020}
-  refine: {enabled: true, q: 0.02, grid: 4, max_mag: 4}
-
-# -------------------------
-# Greedy/budget policy (separate from RL) — target used by RL too
-# -------------------------
-policy:
-  # algorithm: budget
-  target_bpp: 0.50           # RL uses this as initial target; hinge in reward
-  # q_bounds: [8, 22]
-  # K_bounds: [2, 6]
-  # h_low: 0
-  # h_high: 8
-  # score_margin_thresh: 0.10
-
-  # # Alternating scheduler (rate <-> quality) — used by train_rl()
-  # window: 5
-  # target_bpp_step: 0.05
-  # bpp_plateau_tol: 0.01
-  # bpp_margin: 0.05
-  # quality_min_step: 0.002
-  # q_plateau_tol: 0.0005
-  # quality_margin: 0.003
-  # rate_dual_step: 0.25
-  # qual_dual_step: 0.5
-
-# -------------------------
-# Prior & format
-# -------------------------
-prior: {type: deterministic, K: 5}
-format: {magic: AMBI, version: 3}
-
-# -------------------------
-# RL training config (trimmed to fields read by RL)
-# -------------------------
 rl:
   control_split: true
-  # weights:
-  #   bpp_q1: 0.3
-  #   bpp_med: 2.0
-  #   bpp_q3: 3.5
 
-  #   psnr_q1: 1.2
-  #   psnr_med: 2.0
-  #   psnr_q3: 0.6
-
-  #   alpha_bpp: 5
-  #   alpha_psnr: 1
-  #   alpha_msssim: 0.8
-  #   alpha_mismatch: 2.0
   weights:
-    bpp_q1: 0.3      # small penalty still, but slightly higher
-    bpp_med: 0.7     # reduce penalty
-    bpp_q3: 1.2      # cut down strong penalty on high-bpp tail
-    psnr_q1: 1.0     # reward for worst-case PSNR
-    psnr_med: 1.6    # much stronger reward for median PSNR
-    psnr_q3: 0.5     # add some reward for best-case PSNR
-    alpha_bpp: 1.0   # don’t let bpp dominate
-    alpha_psnr: 2.0  # increase influence of psnr
-    alpha_msssim: 0.5
+    bpp_q1: 0.5
+    bpp_med: 1.0
+    bpp_q3: 1.5
+    psnr_q1: 1.5
+    psnr_med: 2.0
+    psnr_q3: 0.5
+    alpha_bpp: 2.0
+    alpha_psnr: 2.0
+    alpha_msssim: 1.0
     alpha_mismatch: 0.5
 
   adapt:
     enabled: true
-    boundary_pts: [[0.40, 35.0], [0.35, 32.0]]
+    boundary_pts: [[0.40, 35.0], [0.30, 32.0]]
     use_stats: { bpp: q3, psnr: q1 }
-    ema_beta: 0.90
-    gains: { kb: 0.15, kp: 0.15 }
-    scales: { bpp: 0.10, psnr: 2.5 }
-    trust_region: 0.10
+    ema_beta: 0.9
+    gains: { kb: 0.2, kp: 0.2 }
+    scales: { bpp: 0.15, psnr: 2.5 }
+    trust_region: 0.15
     alpha_bounds: { min: 0.2, max: 10.0 }
-    decay_when_ok: 0.02
-    warmup_batches: 2
-    # update rule: "residuals" (recommended) or "perp"
+    decay_when_ok: 0.01
+    warmup_batches: 16
     mode: residuals
 
-  # Perceptual eval knobs
+  split_bit_cost: 1.0
+
+  loading:
+    mode: lazy
+    lazy_by: memory
+    mem_fraction: 0.8
+    batch_size: 32
+    iters_per_batch: 1
+    aug_per_image: 3
+    aug_kinds: [hflip, vflip, rot90]
+    shuffle_seed: 0
+
   msssim_on: "y"
   ds_factor: 1.0
   msssim_pow: 2.0
 
-  # Split control overhead (only used when control_split: true)
-  split_bit_cost: 1.0
-  loading:
-    mode: eager            # or "eager"
-    lazy_by: memory        # or "memory" if using mem-based batching
-    mem_fraction: 0.8
-    batch_size: 32
-    iters_per_batch: 1
-
-    # --- Augmentation controls ---
-    aug_per_image: 3      # 1 original + 3 augs
-    aug_kinds: [hflip, vflip, rot90]
-    shuffle_seed: 0       # change for different deterministic orders
-  
   early_stop:
     enabled: true
-    patience: 5          # stop if neither metric improves for 8 consecutive epochs
-    min_delta_bpp: 0.01  # require at least 0.01 bpp drop to count
-    min_delta_db: 0.05   # require at least 0.05 dB rise to count
-    start_after: 5       # ignore the first 5 warmup epochs
+    patience: 15
+    min_delta_bpp: 0.005
+    min_delta_db: 0.02
+    start_after: 20

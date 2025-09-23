@@ -5,9 +5,13 @@ __pycache__/
 *.egg-info/
 *.egg
 *.log
-*.bak
+*.bak*
 *.out
 *.err
+
+*.venv
+*.envrc
+
 build/
 dist/
 logs/
