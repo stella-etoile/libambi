@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ambi"
+version = "0.2.0"
+description = "AMBI: Ambiguity-Managed Block Image codec (compact Python scaffold with K/H/refine)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.25",
+  "Pillow>=10.0",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+metrics = ["scikit-image>=0.22"]
+torch = ["torch>=2.2", "pytorch-msssim>=1.0.0"]
+onnx = ["onnxruntime>=1.17"]
+
+[project.scripts]
+ambi-encode = "ambi.cli.encode:main"
+ambi-decode = "ambi.cli.decode:main"
+ambi-bench = "ambi.cli.bench:main"
+ambi-train = "ambi.cli.train:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ambi*"]

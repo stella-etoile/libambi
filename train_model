@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=train_model
+#SBATCH --output=logs/model.out
+#SBATCH --error=logs/model.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=63493M
+#SBATCH --time=7-00:00:00
+#SBATCH --partition=earth
+
+set -euo pipefail
+mkdir -p logs
+
+export PYTHONUNBUFFERED=1
+export AMBI_NOPROGRESS=1
+
+cd /mnt/Jupiter/project/personal/ambi/
+
+ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train \
+  --config ambi/config.yaml \
+  --out /mnt/Jupiter/project/ambi/models/ambi_policy.ts \
+  --iters 200 \
+  --envs 1 \
+  --workers 1 \
+  --steps 8192 \
+  --lr 3e-4 \
+  --device cpu \
+  --torch-threads 1 \
+  --blas-threads 1
