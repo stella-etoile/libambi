@@ -1,4 +1,3 @@
-# check_progress_ambi.py
 import os, re, glob, argparse
 from datetime import datetime
 

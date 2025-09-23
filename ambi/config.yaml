@@ -13,19 +13,6 @@ rl:
     alpha_msssim: 1.0
     alpha_mismatch: 0.5
 
-  adapt:
-    enabled: true
-    boundary_pts: [[0.40, 35.0], [0.30, 32.0]]
-    use_stats: { bpp: q3, psnr: q1 }
-    ema_beta: 0.9
-    gains: { kb: 0.2, kp: 0.2 }
-    scales: { bpp: 0.15, psnr: 2.5 }
-    trust_region: 0.15
-    alpha_bounds: { min: 0.2, max: 10.0 }
-    decay_when_ok: 0.01
-    warmup_batches: 16
-    mode: residuals
-
   split_bit_cost: 1.0
 
   loading:
@@ -48,3 +35,16 @@ rl:
     min_delta_bpp: 0.005
     min_delta_db: 0.02
     start_after: 20
+
+  # adapt:
+  #   enabled: false
+  #   boundary_pts: [[0.40, 35.0], [0.30, 32.0]]
+  #   use_stats: { bpp: q3, psnr: q1 }
+  #   ema_beta: 0.9
+  #   gains: { kb: 0.2, kp: 0.2 }
+  #   scales: { bpp: 0.15, psnr: 2.5 }
+  #   trust_region: 0.15
+  #   alpha_bounds: { min: 0.2, max: 10.0 }
+  #   decay_when_ok: 0.01
+  #   warmup_batches: 16
+  #   mode: residuals

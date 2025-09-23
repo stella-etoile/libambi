@@ -8,9 +8,14 @@ __pycache__/
 *.bak*
 *.out
 *.err
+*.sh
 
 *.venv
 *.envrc
+
+check_progress.py
+medstdcalc.py
+plot_ambi_logs.py
 
 build/
 dist/

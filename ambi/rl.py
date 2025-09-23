@@ -305,7 +305,6 @@ class AMBIEnv:
         a_bpp = float(getattr(self, "_alpha_bpp", 1.0))
         a_psnr = float(getattr(self, "_alpha_psnr", 1.0))
         a_mss = float(getattr(self, "_alpha_msssim", 1.0))
-        
         bq1, bmed, bq3 = getattr(self.cfg, "_bpp_cuts", (bpp, bpp, bpp))
         pq1, pmed, pq3 = getattr(self.cfg, "_psnr_cuts", (psnr_val, psnr_val, psnr_val))
         wb_q1, wb_med, wb_q3 = getattr(self.cfg, "_bpp_weights", (1.0, 1.0, 1.0))
@@ -869,39 +868,10 @@ def train_rl(
         start_after=int(es_raw.get("start_after", 0)),
     )
     stopper = EarlyStopper(early_cfg)
-    adapt_raw = (yaml_cfg.get("rl", {}) or {}).get("adapt", {}) if yaml_cfg else {}
-    adapt_enabled = bool(adapt_raw.get("enabled", False))
-    if isinstance(adapt_raw.get("boundary_pts", None), (list, tuple)) and len(adapt_raw["boundary_pts"]) >= 2:
-        (x1, y1), (x2, y2) = adapt_raw["boundary_pts"][0], adapt_raw["boundary_pts"][1]
-        x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
-        if abs(x2 - x1) > 1e-12:
-            m = (y2 - y1) / (x2 - x1)
-            c = y1 - m * x1
-        else:
-            m = 60.0; c = 11.0
-    else:
-        m = float(adapt_raw.get("m", 60.0))
-        c = float(adapt_raw.get("c", 11.0))
-    use_stat_bpp = str(adapt_raw.get("use_stats", {}).get("bpp", "q3")).lower()
-    use_stat_psnr = str(adapt_raw.get("use_stats", {}).get("psnr", "q1")).lower()
-    ema_beta = float(adapt_raw.get("ema_beta", 0.9))
-    kb = float(adapt_raw.get("gains", {}).get("kb", 0.15))
-    kp = float(adapt_raw.get("gains", {}).get("kp", 0.15))
-    scale_bpp = float(adapt_raw.get("scales", {}).get("bpp", 0.10))
-    scale_psnr = float(adapt_raw.get("scales", {}).get("psnr", 2.5))
-    trust = float(adapt_raw.get("trust_region", 0.10))
-    a_min = float(adapt_raw.get("alpha_bounds", {}).get("min", 0.2))
-    a_max = float(adapt_raw.get("alpha_bounds", {}).get("max", 10.0))
-    decay = float(adapt_raw.get("decay_when_ok", 0.02))
-    warm_batches = int(adapt_raw.get("warmup_batches", 2))
-    adapt_mode = str(adapt_raw.get("mode", "residuals")).lower()
     alpha_bpp_cur = float(alpha_bpp_base)
     alpha_psnr_cur = float(alpha_psnr_base)
     env_cfg._alpha_bpp = alpha_bpp_cur
     env_cfg._alpha_psnr = alpha_psnr_cur
-    bpp_tail_ema = None
-    psnr_floor_ema = None
-    batches_seen = 0
     use_eager = loading_cfg.mode.lower() == "eager"
     keep_cache = bool(rl.get("loading", {}).get("keep_cache", True))
     cached_imgs: Optional[List[np.ndarray]] = None
@@ -1013,61 +983,6 @@ def train_rl(
                     f"PSNR=[{stats_psnr_e[0]:.2f}, {stats_psnr_e[1]:.2f}, {stats_psnr_e[2]:.2f}, {stats_psnr_e[3]:.2f}, {stats_psnr_e[4]:.2f}]  "
                     f"SSIM={avg_ssim_e:.3f}  MS={avg_msssim_e:.3f}  R~={avg_reward_e:.3f}"
                 )
-            if adapt_enabled and batch_vals:
-                batches_seen += 1
-                if use_stat_bpp == "q3":
-                    bpp_tail = float(np.percentile(bpp_b, 75))
-                elif use_stat_bpp == "p95":
-                    bpp_tail = float(np.percentile(bpp_b, 95))
-                else:
-                    bpp_tail = float(np.percentile(bpp_b, 75))
-                if use_stat_psnr == "q1":
-                    psnr_floor = float(np.percentile(psnr_b, 25))
-                elif use_stat_psnr == "median":
-                    psnr_floor = float(np.percentile(psnr_b, 50))
-                else:
-                    psnr_floor = float(np.percentile(psnr_b, 25))
-                if bpp_tail_ema is None:
-                    bpp_tail_ema = bpp_tail
-                else:
-                    bpp_tail_ema = float(ema_beta * bpp_tail_ema + (1 - ema_beta) * bpp_tail)
-                if psnr_floor_ema is None:
-                    psnr_floor_ema = psnr_floor
-                else:
-                    psnr_floor_ema = float(ema_beta * psnr_floor_ema + (1 - ema_beta) * psnr_floor)
-                if batches_seen > max(1, warm_batches):
-                    psnr_req = m * bpp_tail_ema + c
-                    bpp_req = (psnr_floor_ema - c) / m
-                    d_psnr = max(0.0, psnr_req - psnr_floor_ema)
-                    d_bpp = max(0.0, bpp_tail_ema - bpp_req)
-                    if adapt_mode == "perp":
-                        denom = math.sqrt(m*m + 1.0)
-                        signed_d = (m * bpp_tail_ema - psnr_floor_ema + c) / denom
-                        d_psnr = max(0.0, signed_d)
-                        d_bpp  = max(0.0, signed_d)
-                    upd_psnr = 1.0 + kp * (d_psnr / max(1e-8, scale_psnr))
-                    upd_bpp  = 1.0 + kb * (d_bpp  / max(1e-8, scale_bpp))
-                    upd_psnr = float(min(1.0 + trust, max(1.0 - trust, upd_psnr)))
-                    upd_bpp  = float(min(1.0 + trust, max(1.0 - trust, upd_bpp)))
-                    a_psnr_old = alpha_psnr_cur
-                    a_bpp_old  = alpha_bpp_cur
-                    if d_psnr > 0.0:
-                        alpha_psnr_cur = float(np.clip(alpha_psnr_cur * upd_psnr, a_min, a_max))
-                    else:
-                        alpha_psnr_cur = float((1 - decay) * alpha_psnr_cur + decay * alpha_psnr_base)
-                    if d_bpp > 0.0:
-                        alpha_bpp_cur = float(np.clip(alpha_bpp_cur * upd_bpp, a_min, a_max))
-                    else:
-                        alpha_bpp_cur = float((1 - decay) * alpha_bpp_cur + decay * alpha_bpp_base)
-                    env_cfg._alpha_psnr = alpha_psnr_cur
-                    env_cfg._alpha_bpp  = alpha_bpp_cur
-                    print(
-                        f"[ADAPT] bpp_tail_ema={bpp_tail_ema:.3f} psnr_floor_ema={psnr_floor_ema:.2f} "
-                        f"req_psnr={psnr_req:.2f} req_bpp={bpp_req:.3f} "
-                        f"d_psnr={d_psnr:.2f} d_bpp={d_bpp:.3f} "
-                        f"alpha_psnr:{a_psnr_old:.3f}->{alpha_psnr_cur:.3f} "
-                        f"alpha_bpp:{a_bpp_old:.3f}->{alpha_bpp_cur:.3f}"
-                    )
             del envs, imgs
             gc.collect()
             if torch.cuda.is_available():
