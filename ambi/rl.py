@@ -120,6 +120,10 @@ class EnvCfg:
     ds_factor: float = 1.0
     msssim_pow: float = 1.0
     obs_dim: Optional[int] = None
+    psnr_margin_db: float = 0.5
+    msssim_floor: float = 0.97
+    min_psnr_db: Optional[float] = None
+    min_msssim: Optional[float] = None
 
 class AMBIEnv:
     def __init__(self, img: np.ndarray, cfg: EnvCfg):
@@ -307,15 +311,11 @@ class AMBIEnv:
         a_mss = float(getattr(self, "_alpha_msssim", 1.0))
         bq1, bmed, bq3 = getattr(self.cfg, "_bpp_cuts", (bpp, bpp, bpp))
         pq1, pmed, pq3 = getattr(self.cfg, "_psnr_cuts", (psnr_val, psnr_val, psnr_val))
-        wb_q1, wb_med, wb_q3 = getattr(self.cfg, "_bpp_weights", (1.0, 1.0, 1.0))
-        wp_q1, wp_med, wp_q3 = getattr(self.cfg, "_psnr_weights", (1.0, 1.0, 1.0))
-        w_bpp  = self._soft_qweight(bpp,      bq1, bmed, bq3, wb_q1, wb_med, wb_q3, invert=False)
-        w_psnr = self._soft_qweight(psnr_val, pq1, pmed, pq3, wp_q1, wp_med, wp_q3, invert=True)
-        lb, mb, hb = self._tri_memberships(bpp, bq1, bmed, bq3)
-        lp, mp, hp = self._tri_memberships(psnr_val, pq1, pmed, pq3)
-        a_mismatch = float(getattr(self, "_alpha_mismatch", 0.0))
-        mismatch_pen = a_mismatch * hb * lp
-        R = (a_bpp * w_bpp * bpp) - (a_psnr * w_psnr * psnr_val) - (a_mss * msssim_val) + mismatch_pen
+        psnr_req = float(self.cfg.min_psnr_db) if self.cfg.min_psnr_db is not None else float(pmed - self.cfg.psnr_margin_db)
+        mss_req = float(self.cfg.min_msssim) if self.cfg.min_msssim is not None else float(self.cfg.msssim_floor)
+        pen_psnr = max(0.0, psnr_req - psnr_val)
+        pen_mss = max(0.0, mss_req - msssim_val)
+        R = a_bpp * bpp + a_psnr * pen_psnr + a_mss * pen_mss
         reward = -float(R)
         info = {
             "bpp": bpp, "mse": mse, "ssim": ssim_val, "msssim": msssim_val, "gmsd": gmsd_val,
@@ -323,6 +323,8 @@ class AMBIEnv:
             "K": K, "H": H, "split": 0,
             "reward": reward, "score": -reward,
             "psnr": psnr_val,
+            "psnr_req": psnr_req,
+            "mss_req": mss_req
         }
         return reward, info
 
@@ -820,6 +822,10 @@ def train_rl(
         ds_factor=float(rl.get("ds_factor", 1.0)),
         msssim_pow=float(rl.get("msssim_pow", 1.0)),
         obs_dim=None,
+        psnr_margin_db=float(rl.get("psnr_margin_db", 0.5)),
+        msssim_floor=float(rl.get("msssim_floor", 0.97)),
+        min_psnr_db=rl.get("min_psnr_db", None),
+        min_msssim=rl.get("min_msssim", None),
     )
     bpp_q1  = float(w.get("bpp_q1", 1/3))
     bpp_med = float(w.get("bpp_med", 1/3))
@@ -948,40 +954,41 @@ def train_rl(
                 trainer.update(obs, act, logp_old, adv, ret)
             if batch_vals:
                 bpp_b = [v["bpp"] for v in batch_vals]
-                mse_b = [v["mse"] for v in batch_vals]
-                psnr_b = [10.0 * math.log10(1.0 / max(m, 1e-12)) for m in mse_b]
+                psnr_b = [v["psnr"] for v in batch_vals]
+                mss_b = [v["msssim"] for v in batch_vals]
                 stats_bpp_b = np.percentile(bpp_b, [0, 25, 50, 75, 100])
                 stats_psnr_b = np.percentile(psnr_b, [0, 25, 50, 75, 100])
-                avg_ssim_b = float(np.mean([v["ssim"] for v in batch_vals]))
-                avg_msssim_b = float(np.mean([v["msssim"] for v in batch_vals]))
-                avg_reward_b = -(WBPP * float(np.mean(bpp_b)) - WPSNR * float(np.mean(psnr_b)) - alpha_msssim * avg_msssim_b)
+                avg_msssim_b = float(np.mean(mss_b))
+                psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_b[2] - env_cfg.psnr_margin_db)
+                mss_req_b = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
+                pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(psnr_b)))
+                pen_mss_b = max(0.0, mss_req_b - avg_msssim_b)
+                avg_reward_b = -(env_cfg._alpha_bpp * float(np.mean(bpp_b)) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
                 print(
                     f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  BATCH  "
                     f"bpp=[{stats_bpp_b[0]:.3f}, {stats_bpp_b[1]:.3f}, {stats_bpp_b[2]:.3f}, {stats_bpp_b[3]:.3f}, {stats_bpp_b[4]:.3f}]  "
                     f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
-                    f"SSIM={avg_ssim_b:.3f}  MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
+                    f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
                 )
                 env_cfg._bpp_cuts = (float(stats_bpp_b[1]), float(stats_bpp_b[2]), float(stats_bpp_b[3]))
                 env_cfg._psnr_cuts = (float(stats_psnr_b[1]), float(stats_psnr_b[2]), float(stats_psnr_b[3]))
-                env_cfg._bpp_weights = (bpp_q1, bpp_med, bpp_q3)
-                env_cfg._psnr_weights = (psnr_q1, psnr_med, psnr_q3)
-                print(f"[QWEIGHTS] bpp_cuts=(q1={env_cfg._bpp_cuts[0]:.3f}, med={env_cfg._bpp_cuts[1]:.3f}, q3={env_cfg._bpp_cuts[2]:.3f})  "
-                      f"psnr_cuts=(q1={env_cfg._psnr_cuts[0]:.2f}, med={env_cfg._psnr_cuts[1]:.2f}, q3={env_cfg._psnr_cuts[2]:.2f})  "
-                      f"wb={env_cfg._bpp_weights}  wp={env_cfg._psnr_weights}")
             if epoch_vals:
                 bpp_e = [v["bpp"] for v in epoch_vals]
-                mse_e = [v["mse"] for v in epoch_vals]
-                psnr_e = [10.0 * math.log10(1.0 / max(m, 1e-12)) for m in mse_e]
+                psnr_e = [v["psnr"] for v in epoch_vals]
+                mss_e = [v["msssim"] for v in epoch_vals]
                 stats_bpp_e = np.percentile(bpp_e, [0, 25, 50, 75, 100])
                 stats_psnr_e = np.percentile(psnr_e, [0, 25, 50, 75, 100])
-                avg_ssim_e = float(np.mean([v["ssim"] for v in epoch_vals]))
-                avg_msssim_e = float(np.mean([v["msssim"] for v in epoch_vals]))
-                avg_reward_e = -(WBPP * float(np.mean(bpp_e)) - WPSNR * float(np.mean(psnr_e)) - alpha_msssim * avg_msssim_e)
+                avg_msssim_e = float(np.mean(mss_e))
+                psnr_req_e = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_e[2] - env_cfg.psnr_margin_db)
+                mss_req_e = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
+                pen_psnr_e = max(0.0, psnr_req_e - float(np.mean(psnr_e)))
+                pen_mss_e = max(0.0, mss_req_e - avg_msssim_e)
+                avg_reward_e = -(env_cfg._alpha_bpp * float(np.mean(bpp_e)) + env_cfg._alpha_psnr * pen_psnr_e + env_cfg._alpha_msssim * pen_mss_e)
                 print(
                     f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  TOTAL  "
                     f"bpp=[{stats_bpp_e[0]:.3f}, {stats_bpp_e[1]:.3f}, {stats_bpp_e[2]:.3f}, {stats_bpp_e[3]:.3f}, {stats_bpp_e[4]:.3f}]  "
                     f"PSNR=[{stats_psnr_e[0]:.2f}, {stats_psnr_e[1]:.2f}, {stats_psnr_e[2]:.2f}, {stats_psnr_e[3]:.2f}, {stats_psnr_e[4]:.2f}]  "
-                    f"SSIM={avg_ssim_e:.3f}  MS={avg_msssim_e:.3f}  R~={avg_reward_e:.3f}"
+                    f"MS={avg_msssim_e:.3f}  R~={avg_reward_e:.3f}"
                 )
             del envs, imgs
             gc.collect()
@@ -989,9 +996,7 @@ def train_rl(
                 torch.cuda.empty_cache()
         if epoch_vals:
             bpp_vals = [v["bpp"] for v in epoch_vals]
-            mse_vals = [v["mse"] for v in epoch_vals]
-            psnr_vals = [10.0 * math.log10(1.0 / max(m, 1e-12)) for m in mse_vals]
-            ssim_vals = [v["ssim"] for v in epoch_vals]
+            psnr_vals = [v["psnr"] for v in epoch_vals]
             msssim_vals = [v["msssim"] for v in epoch_vals]
             med_bpp  = float(np.median(bpp_vals))
             min_bpp  = float(np.min(bpp_vals))
@@ -1003,24 +1008,24 @@ def train_rl(
             max_psnr = float(np.max(psnr_vals))
             q1_psnr  = float(np.percentile(psnr_vals, 25))
             q3_psnr  = float(np.percentile(psnr_vals, 75))
-            avg_ssim = float(np.mean(ssim_vals))
             avg_msssim = float(np.mean(msssim_vals))
-            msssim_med = float(np.median(msssim_vals))
-            W_bpp  = bpp_q1 * q1_bpp + bpp_med * med_bpp + bpp_q3 * q3_bpp
-            W_psnr = psnr_q1 * q1_psnr + psnr_med * med_psnr + psnr_q3 * q3_psnr
-            W_total = alpha_bpp_cur * W_bpp - alpha_psnr_cur * W_psnr - alpha_msssim * msssim_med
+            psnr_req_ep = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(med_psnr - env_cfg.psnr_margin_db)
+            mss_req_ep = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
+            pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(psnr_vals)))
+            pen_mss_ep = max(0.0, mss_req_ep - avg_msssim)
+            W_total = -(env_cfg._alpha_bpp * float(np.mean(bpp_vals)) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
             print(
                 f"[RL] iter {it+1}/{iters}  "
                 f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
                 f"PSNR_med={med_psnr:.2f} dB (min={min_psnr:.2f}, q1={q1_psnr:.2f}, q3={q3_psnr:.2f}, max={max_psnr:.2f})  "
-                f"SSIM={avg_ssim:.3f}  MS-SSIM={avg_msssim:.3f}  "
-                f"Wbpp={W_bpp:.3f}  Wpsnr={W_psnr:.2f}  mSSIM_med={msssim_med:.3f}  Wtotal={W_total:.3f}  "
-                f"alpha_bpp={alpha_bpp_cur:.3f} alpha_psnr={alpha_psnr_cur:.3f}"
+                f"MS-SSIM_avg={avg_msssim:.3f}  "
+                f"Wtotal={W_total:.3f}  "
+                f"alpha_bpp={env_cfg._alpha_bpp:.3f} alpha_psnr={env_cfg._alpha_psnr:.3f}"
             )
-            should_stop, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
+            stopper_flag, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
             tag = f"(improved: bpp_med={bpp_imp}, psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience})"
             print(f"[RL] {tag}")
-            if should_stop:
+            if stopper_flag:
                 print(
                     f"[RL] early stop: no median bpp/psnr improvement for {early_cfg.patience} epochs "
                     f"(after warmup {early_cfg.start_after})."

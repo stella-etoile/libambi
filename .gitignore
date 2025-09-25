@@ -16,8 +16,10 @@ __pycache__/
 check_progress.py
 medstdcalc.py
 plot_ambi_logs.py
+check_size.py
 
 build/
 dist/
 logs/
 photo/
+plots/
