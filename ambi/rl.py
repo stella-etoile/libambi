@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math, gc, os
+import math, gc, os, time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -828,8 +828,10 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
         num_batches = max(1, math.ceil(len(paths_val) / est_units_per_batch0))
     batch_idx = 0
+    val_epoch_start = time.perf_counter()
     for imgs in batcher:
         batch_idx += 1
+        batch_start = time.perf_counter()
         approx_tag = "" if batcher.mode == "count" else "~"
         print(f"[Epoch {it+1}/{iters}] VAL {batch_idx}/{approx_tag}{num_batches}")
         envs = build_envs(imgs, env_cfg, n_envs)
@@ -854,10 +856,13 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
                 f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
                 f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
             )
+        batch_elapsed = time.perf_counter() - batch_start
+        print(f"[Epoch {it+1}/{iters}] VAL-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
         del envs, imgs, obs, act, logp_old, adv, ret, info
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    total_val_elapsed = time.perf_counter() - val_epoch_start
     if epoch_vals:
         bpp_vals = [v["bpp"] for v in epoch_vals]
         psnr_vals = [v["psnr"] for v in epoch_vals]
@@ -883,13 +888,15 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
             f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
             f"PSNR_med={med_psnr:.2f} dB (min={min_psnr:.2f}, q1={q1_psnr:.2f}, q3={q3_psnr:.2f}, max={max_psnr:.2f})  "
             f"MS-SSIM_avg={avg_msssim:.3f}  "
-            f"Wtotal={W_total:.3f}"
+            f"Wtotal={W_total:.3f}  "
+            f"VAL_epoch_elapsed={total_val_elapsed:.2f}s"
         )
+        trainer.net.train()
         return med_bpp, med_psnr
     else:
-        print(f"[VAL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)")
+        print(f"[VAL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  VAL_epoch_elapsed={total_val_elapsed:.2f}s")
+        trainer.net.train()
         return None, None
-    trainer.net.train()
 
 def train_rl(
     data_root: Path,
@@ -958,7 +965,6 @@ def train_rl(
     setattr(env_cfg, "_psnr_weights", (psnr_q1, psnr_med, psnr_q3))
     obs_dim = int(env_probe.obs_dim)
     trainer = PPOTrainer(obs_dim, ppo_cfg, control_split=env_cfg.control_split)
-    mem_mode = "memory" if rl.get("loading", {}).get("mode", "eager").lower() == "lazy" and rl.get("loading", {}).get("lazy_by", "count").lower().startswith("mem") else "count"
     loading_cfg = LoadingCfg(
         mode=str(rl.get("loading", {}).get("mode", "eager")),
         lazy_by=str(rl.get("loading", {}).get("lazy_by", "count")),
@@ -994,7 +1000,9 @@ def train_rl(
         )
     val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_100")
     val_paths = list_image_paths(val_root)
+
     for it in range(iters):
+        epoch_start = time.perf_counter()
         epoch_vals: List[Dict[str, float]] = []
         if use_eager and keep_cache and cached_imgs is not None:
             batcher = ImageBatcher(
@@ -1046,6 +1054,7 @@ def train_rl(
         batch_idx = 0
         for imgs in batcher:
             batch_idx += 1
+            batch_start = time.perf_counter()
             approx_tag = "" if (use_eager and keep_cache and cached_imgs is not None) or batcher.mode == "count" else "~"
             print(f"[Epoch {it+1}/{iters}] Batch {batch_idx}/{approx_tag}{num_batches}")
             envs = build_envs(imgs, env_cfg, n_envs)
@@ -1078,28 +1087,14 @@ def train_rl(
                 )
                 env_cfg._bpp_cuts = (float(stats_bpp_b[1]), float(stats_bpp_b[2]), float(stats_bpp_b[3]))
                 env_cfg._psnr_cuts = (float(stats_psnr_b[1]), float(stats_psnr_b[2]), float(stats_psnr_b[3]))
-            if epoch_vals:
-                bpp_e = [v["bpp"] for v in epoch_vals]
-                psnr_e = [v["psnr"] for v in epoch_vals]
-                mss_e = [v["msssim"] for v in epoch_vals]
-                stats_bpp_e = np.percentile(bpp_e, [0, 25, 50, 75, 100])
-                stats_psnr_e = np.percentile(psnr_e, [0, 25, 50, 75, 100])
-                avg_msssim_e = float(np.mean(mss_e))
-                psnr_req_e = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_e[2] - env_cfg.psnr_margin_db)
-                mss_req_e = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-                pen_psnr_e = max(0.0, psnr_req_e - float(np.mean(psnr_e)))
-                pen_mss_e = max(0.0, mss_req_e - avg_msssim_e)
-                avg_reward_e = -(env_cfg._alpha_bpp * float(np.mean(bpp_e)) + env_cfg._alpha_psnr * pen_psnr_e + env_cfg._alpha_msssim * pen_mss_e)
-                print(
-                    f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  TOTAL  "
-                    f"bpp=[{stats_bpp_e[0]:.3f}, {stats_bpp_e[1]:.3f}, {stats_bpp_e[2]:.3f}, {stats_bpp_e[3]:.3f}, {stats_bpp_e[4]:.3f}]  "
-                    f"PSNR=[{stats_psnr_e[0]:.2f}, {stats_psnr_e[1]:.2f}, {stats_psnr_e[2]:.2f}, {stats_psnr_e[3]:.2f}, {stats_psnr_e[4]:.2f}]  "
-                    f"MS={avg_msssim_e:.3f}  R~={avg_reward_e:.3f}"
-                )
+            batch_elapsed = time.perf_counter() - batch_start
+            print(f"[Epoch {it+1}/{iters}] TRAIN-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
             del envs, imgs
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        epoch_elapsed = time.perf_counter() - epoch_start
         if epoch_vals:
             bpp_vals = [v["bpp"] for v in epoch_vals]
             psnr_vals = [v["psnr"] for v in epoch_vals]
@@ -1126,6 +1121,7 @@ def train_rl(
                 f"PSNR_med={med_psnr:.2f} dB (min={min_psnr:.2f}, q1={q1_psnr:.2f}, q3={q3_psnr:.2f}, max={max_psnr:.2f})  "
                 f"MS-SSIM_avg={avg_msssim:.3f}  "
                 f"Wtotal={W_total:.3f}  "
+                f"TRAIN_epoch_elapsed={epoch_elapsed:.2f}s  "
                 f"alpha_bpp={env_cfg._alpha_bpp:.3f} alpha_psnr={env_cfg._alpha_psnr:.3f}"
             )
             vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters)
@@ -1136,11 +1132,13 @@ def train_rl(
                 stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
                 tag = f"(val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
             print(f"[RL] {tag}")
+
             ckpt_dir = out_model.parent / "checkpoints"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
             trainer.save_torchscript(ckpt_path)
             print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+
             if stopper_flag:
                 print(
                     f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs "
@@ -1150,7 +1148,7 @@ def train_rl(
                 print(f"[RL] saved TorchScript policy -> {out_model}")
                 return
         else:
-            print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)")
+            print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  TRAIN_epoch_elapsed={epoch_elapsed:.2f}s")
             vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters)
             if vbpp is None or vpsnr is None:
                 stopper_flag, bpp_imp, db_imp = stopper.update(it, float("inf"), float("-inf"))
@@ -1162,5 +1160,6 @@ def train_rl(
             ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
             trainer.save_torchscript(ckpt_path)
             print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+
     trainer.save_torchscript(out_model)
     print(f"[RL] saved TorchScript policy -> {out_model}")
