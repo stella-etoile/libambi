@@ -1025,6 +1025,13 @@ def train_rl(
             stopper_flag, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
             tag = f"(improved: bpp_med={bpp_imp}, psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience})"
             print(f"[RL] {tag}")
+
+            ckpt_dir = out_model.parent / "checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
+            trainer.save_torchscript(ckpt_path)
+            print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+
             if stopper_flag:
                 print(
                     f"[RL] early stop: no median bpp/psnr improvement for {early_cfg.patience} epochs "
@@ -1033,7 +1040,14 @@ def train_rl(
                 trainer.save_torchscript(out_model)
                 print(f"[RL] saved TorchScript policy -> {out_model}")
                 return
+
         else:
             print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)")
+
+            ckpt_dir = out_model.parent / "checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
+            trainer.save_torchscript(ckpt_path)
+            print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
     trainer.save_torchscript(out_model)
     print(f"[RL] saved TorchScript policy -> {out_model}")
