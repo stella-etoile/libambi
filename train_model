@@ -41,26 +41,38 @@ cd /mnt/Jupiter/project/personal/libambi
 #   --torch-threads 1 \
 #   --blas-threads 1
 
-# ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train_14613 \
-#   --config ambi/config.yaml \
-#   --out models/ambi_policy_cpu_e1w1.ts \
-#   --iters 300 \
-#   --envs 1 \
-#   --workers 1 \
-#   --steps 8192 \
-#   --lr 1e-4 \
-#   --device cpu \
-#   --torch-threads 1 \
-#   --blas-threads 1
-
-ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train_100 \
+ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train_14613 \
   --config ambi/config.yaml \
   --out models/ambi_policy_cpu_e1w1.ts \
   --iters 300 \
   --envs 1 \
   --workers 1 \
-  --steps 128 \
+  --steps 16384 \
   --lr 1e-4 \
   --device cpu \
   --torch-threads 1 \
   --blas-threads 1
+
+# ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train_6000 \
+#   --config ambi/config.yaml \
+#   --out models/ambi_policy_cpu_e1w1.ts \
+#   --iters 300 \
+#   --envs 1 \
+#   --workers 1 \
+#   --steps 512 \
+#   --lr 1e-4 \
+#   --device cpu \
+#   --torch-threads 1 \
+#   --blas-threads 1
+
+# ambi-train /mnt/Jupiter/dataset/ambi/clic2024_split/train_100 \
+#   --config ambi/config.yaml \
+#   --out models/ambi_policy_cpu_e1w1.ts \
+#   --iters 300 \
+#   --envs 1 \
+#   --workers 1 \
+#   --steps 128 \
+#   --lr 1e-4 \
+#   --device cpu \
+#   --torch-threads 1 \
+#   --blas-threads 1

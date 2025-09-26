@@ -9,6 +9,7 @@ __pycache__/
 *.out
 *.err
 *.sh
+*.csv
 
 *.venv
 *.envrc
@@ -19,9 +20,12 @@ check_progress.py
 medstdcalc.py
 plot_ambi_logs.py
 check_size.py
+plot_test.py
 
 build/
 dist/
 logs/
 photo/
 plots/
+models/
+plots_bpp_psnr/

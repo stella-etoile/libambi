@@ -18,6 +18,22 @@ from ambi.partition import dynamic_quadtree_leaves
 from ambi.compress import choose_compressor, COMP_NONE, COMP_ZLIB
 from ambi.distortion import ssim, ms_ssim
 
+import ctypes
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _have_malloc_trim = hasattr(_libc, "malloc_trim")
+except Exception:
+    _libc = None
+    _have_malloc_trim = False
+
+def malloc_trim(pad: int = 0) -> None:
+    try:
+        if _libc is not None and _have_malloc_trim:
+            _libc.malloc_trim(ctypes.c_size_t(pad))
+    except Exception:
+        pass
+
 if os.environ.get("AMBI_NOPROGRESS", "") == "1":
     class _NoTqdm:
         def __init__(self, *a, **k): pass
@@ -823,6 +839,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            malloc_trim()
         vm0 = psutil.virtual_memory()
         budget0 = max(128 * 1024 * 1024, int(vm0.available * loading_cfg.mem_fraction))
         est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
@@ -862,6 +879,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        malloc_trim()
     total_val_elapsed = time.perf_counter() - val_epoch_start
     if epoch_vals:
         bpp_vals = [v["bpp"] for v in epoch_vals]
@@ -998,7 +1016,7 @@ def train_rl(
             aug_per_image=loading_cfg.aug_per_image,
             seed=loading_cfg.shuffle_seed
         )
-    val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_100")
+    val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_2923")
     val_paths = list_image_paths(val_root)
 
     for it in range(iters):
@@ -1093,6 +1111,7 @@ def train_rl(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            malloc_trim()
 
         epoch_elapsed = time.perf_counter() - epoch_start
         if epoch_vals:
@@ -1146,6 +1165,7 @@ def train_rl(
                 )
                 trainer.save_torchscript(out_model)
                 print(f"[RL] saved TorchScript policy -> {out_model}")
+                malloc_trim()
                 return
         else:
             print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  TRAIN_epoch_elapsed={epoch_elapsed:.2f}s")
@@ -1160,6 +1180,8 @@ def train_rl(
             ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
             trainer.save_torchscript(ckpt_path)
             print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+            malloc_trim()
 
     trainer.save_torchscript(out_model)
     print(f"[RL] saved TorchScript policy -> {out_model}")
+    malloc_trim()
