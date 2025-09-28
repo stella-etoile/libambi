@@ -209,7 +209,7 @@ def main():
     outdir = ensure_outdir("plots_bpp_psnr")
     jpeg_dir = "/mnt/Jupiter/dataset/ambi/clic2024_split/train_200"
     jpeg_qualities = [0,5,10,20,30,40,50,60,70,80,90,95,100]
-    jpeg_sample = 64
+    jpeg_sample = 10
 
     df_b = load_per_batch(per_batch)
     jpeg_df = jpeg_quantiles_curve(jpeg_dir, jpeg_qualities, jpeg_sample)

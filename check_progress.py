@@ -34,6 +34,9 @@ PAT_EARLY = re.compile(
 )
 PAT_SAVE = re.compile(r'^\[RL\]\s+saved epoch checkpoint -> (?P<path>.+)$')
 PAT_VAL_PROGRESS = re.compile(r'^\[Epoch\s+(?P<epoch>\d+)\/(?P<epochs>\d+)\]\s+VAL\s+(?P<k>\d+)\/(?P<n>~?\d+)')
+PAT_PROGRESS = re.compile(
+    r'^\[PROGRESS\]\s+(?P<label>.+?)\s+(?P<pct>\d+)%\s+\((?P<done>\d+)\/(?P<total>\d+)\)\s+elapsed=(?P<elapsed>[\d\.]+)s'
+)
 
 def parse_time_to_seconds(s):
     s = s.strip()
@@ -77,10 +80,40 @@ def parse_files_to_csv(files, outdir):
     per_batch = []
     per_epoch = {}
     last_checkpoint = {}
+    per_progress = []
+    cur_epoch = None
+    cur_phase = None
+    cur_batch = None
     for filepath in files:
         with open(filepath, 'r', errors='ignore') as f:
             for line in f:
                 line = line.rstrip('\n')
+                m = PAT_BATCH_HDR.match(line)
+                if m:
+                    cur_epoch = int(m.group('epoch'))
+                    cur_phase = 'train'
+                    cur_batch = int(m.group('batch'))
+                    continue
+                m = PAT_VAL_PROGRESS.match(line)
+                if m:
+                    cur_epoch = int(m.group('epoch'))
+                    cur_phase = 'val'
+                    cur_batch = int(m.group('k'))
+                    continue
+                m = PAT_PROGRESS.match(line)
+                if m and cur_epoch is not None and cur_phase is not None and cur_batch is not None:
+                    per_progress.append({
+                        'file': os.path.basename(filepath),
+                        'epoch': cur_epoch,
+                        'phase': cur_phase,
+                        'batch': cur_batch,
+                        'label': m.group('label'),
+                        'pct': int(m.group('pct')),
+                        'done': int(m.group('done')),
+                        'total': int(m.group('total')),
+                        'elapsed_s': float(m.group('elapsed')),
+                    })
+                    continue
                 m = PAT_BATCH_METRICS.match(line)
                 if m:
                     epoch = int(m.group('epoch'))
@@ -215,11 +248,13 @@ def parse_files_to_csv(files, outdir):
         'val_ms_avg','val_Wtotal','val_epoch_elapsed_s',
         'improved_bpp','improved_psnr','early_wait','early_patience','checkpoint'
     ]
+    progress_header = ['file','epoch','phase','batch','label','pct','done','total','elapsed_s']
     outdir = pathlib.Path(outdir)
     write_csv(outdir/'per_batch.csv', per_batch, batch_header)
     rows = [per_epoch[k] for k in sorted(per_epoch.keys())]
     write_csv(outdir/'per_epoch.csv', rows, epoch_header)
-    return str(outdir/'per_batch.csv'), str(outdir/'per_epoch.csv')
+    write_csv(outdir/'per_progress.csv', per_progress, progress_header)
+    return str(outdir/'per_batch.csv'), str(outdir/'per_epoch.csv'), str(outdir/'per_progress.csv')
 
 def to_float(x):
     try:
@@ -268,11 +303,12 @@ def seconds_to_hms_str(x):
         return f"{m}m{s}s"
     return f"{s}s"
 
-def build_rows_from_csv(per_batch_csv, per_epoch_csv, phase):
+def build_rows_from_csv(per_batch_csv, per_epoch_csv, per_progress_csv, phase):
     rows_by_epoch = {}
     r_avg_by_epoch = {}
     total_row_by_epoch = {}
     dt_by_epoch_batch = {}
+    prog_by_epoch_batch = {}
     with open(per_batch_csv, "r", encoding="utf-8", errors="ignore") as fb:
         r = csv.DictReader(fb)
         for d in r:
@@ -307,9 +343,32 @@ def build_rows_from_csv(per_batch_csv, per_epoch_csv, phase):
                 R = to_float(d.get("val_Wtotal"))
                 r_avg_by_epoch[ep] = 0.0 if math.isnan(R) else R
                 total_row_by_epoch[ep] = {"batch": 0, "bpp": bpp, "psnr": psnr, "ms": ms, "R": R}
+    with open(per_progress_csv, "r", encoding="utf-8", errors="ignore") as fp:
+        r = csv.DictReader(fp)
+        for d in r:
+            if d.get("phase","").strip().lower() != phase:
+                continue
+            ep = int(d["epoch"])
+            batch = int(d["batch"])
+            label = d["label"]
+            pct = int(d["pct"])
+            done = int(d["done"])
+            total = int(d["total"])
+            elapsed_s = to_float(d["elapsed_s"])
+            prog_by_epoch_batch.setdefault(ep, {})
+            prog_by_epoch_batch[ep].setdefault(batch, {})
+            prev = prog_by_epoch_batch[ep][batch].get(label)
+            if (prev is None) or (pct > prev["pct"]) or (pct == prev["pct"] and (elapsed_s or -1) >= (prev["elapsed_s"] or -1)):
+                prog_by_epoch_batch[ep][batch][label] = {
+                    "label": label,
+                    "pct": pct,
+                    "done": done,
+                    "total": total,
+                    "elapsed_s": elapsed_s,
+                }
     for ep, rows in rows_by_epoch.items():
         rows.sort(key=lambda x: x["batch"])
-    return rows_by_epoch, r_avg_by_epoch, total_row_by_epoch, dt_by_epoch_batch
+    return rows_by_epoch, r_avg_by_epoch, total_row_by_epoch, dt_by_epoch_batch, prog_by_epoch_batch
 
 def compute_total_from_batches(rows):
     if not rows:
@@ -338,7 +397,7 @@ def prepare_row_strings(rows, total_row):
     psnr_widths = build_list_widths(psnr_items_rows) if psnr_items_rows else [0]*5
     return bpp_widths, psnr_widths, total_bpp_items, total_psnr_items
 
-def build_table_strings(rows, r_avg_epoch, dt_by_batch,
+def build_table_strings(rows, r_avg_epoch, dt_by_batch, prog_by_batch,
                         color_mode, blue_mode, blue_threshold, use_rrel_for_blue,
                         total_row, total_dt_avg, total_elapsed_str):
     headers = ["batch", "bpp[min,q1,med,q3,max]", "PSNR[min,q1,med,q3,max]", "MS", "R", "R_rel", "dt_batch", "eta"]
@@ -362,6 +421,19 @@ def build_table_strings(rows, r_avg_epoch, dt_by_batch,
             "nan" if (dt is None or math.isnan(dt)) else f"{dt:.1f}s",
             "nan",
         ])
+        plist_map = prog_by_batch.get(row["batch"], {})
+        for lbl in sorted(plist_map.keys()):
+            p = plist_map[lbl]
+            raw_rows.append([
+                "PROG",
+                p["label"],
+                f"{int(p['pct'])}% ({p['done']}/{p['total']})",
+                "-",
+                "-",
+                "-",
+                "nan" if (p["elapsed_s"] is None or math.isnan(p["elapsed_s"])) else f"{p['elapsed_s']:.1f}s",
+                "-",
+            ])
     total_raw = None
     if total_row is not None:
         if total_bpp_items is None:
@@ -394,23 +466,36 @@ def build_table_strings(rows, r_avg_epoch, dt_by_batch,
     lines.append(header_line)
     lines.append(sep)
     for rvals in raw_rows:
-        r_value = float(rvals[4])
-        c0, c1 = color_for_row(
-            r_value, r_avg_epoch,
-            blue_mode, blue_threshold,
-            color_mode, use_rrel_for_blue
-        )
-        out = "  ".join([
-            rvals[0].rjust(widths[0]),
-            rvals[1].ljust(widths[1]),
-            rvals[2].ljust(widths[2]),
-            rvals[3].rjust(widths[3]),
-            rvals[4].rjust(widths[4]),
-            rvals[5].rjust(widths[5]),
-            rvals[6].rjust(widths[6]),
-            rvals[7].rjust(widths[7]),
-        ])
-        lines.append(f"{c0}{out}{c1}")
+        if rvals[0] != "PROG":
+            r_value = float(rvals[4])
+            c0, c1 = color_for_row(
+                r_value, r_avg_epoch,
+                blue_mode, blue_threshold,
+                color_mode, use_rrel_for_blue
+            )
+            out = "  ".join([
+                rvals[0].rjust(widths[0]),
+                rvals[1].ljust(widths[1]),
+                rvals[2].ljust(widths[2]),
+                rvals[3].rjust(widths[3]),
+                rvals[4].rjust(widths[4]),
+                rvals[5].rjust(widths[5]),
+                rvals[6].rjust(widths[6]),
+                rvals[7].rjust(widths[7]),
+            ])
+            lines.append(f"{c0}{out}{c1}")
+        else:
+            out = "  ".join([
+                rvals[0].rjust(widths[0]),
+                rvals[1].ljust(widths[1]),
+                rvals[2].ljust(widths[2]),
+                rvals[3].rjust(widths[3]),
+                rvals[4].rjust(widths[4]),
+                rvals[5].rjust(widths[5]),
+                rvals[6].rjust(widths[6]),
+                rvals[7].rjust(widths[7]),
+            ])
+            lines.append(out)
     if total_raw:
         lines.append(sep)
         out = "  ".join([
@@ -427,7 +512,7 @@ def build_table_strings(rows, r_avg_epoch, dt_by_batch,
     lines.append(sep)
     return lines
 
-def print_epoch_table(title, epoch_id, rows, r_avg_epoch, dt_by_batch,
+def print_epoch_table(title, epoch_id, rows, r_avg_epoch, dt_by_batch, prog_by_batch,
                       color_mode, blue_mode, blue_threshold, use_rrel_for_blue,
                       total_row, total_dt_avg, total_elapsed_str):
     if not rows:
@@ -436,7 +521,7 @@ def print_epoch_table(title, epoch_id, rows, r_avg_epoch, dt_by_batch,
     print(t)
     print("-" * len(t))
     for ln in build_table_strings(
-        rows, r_avg_epoch, dt_by_batch,
+        rows, r_avg_epoch, dt_by_batch, prog_by_batch,
         color_mode, blue_mode, blue_threshold, use_rrel_for_blue,
         total_row, total_dt_avg, total_elapsed_str
     ):
@@ -452,7 +537,7 @@ def main():
     ap.add_argument("--blue-by", choices=["R","Rrel"], default="R")
     args = ap.parse_args()
 
-    per_batch_csv, per_epoch_csv = parse_files_to_csv([args.file], args.out)
+    per_batch_csv, per_epoch_csv, per_progress_csv = parse_files_to_csv([args.file], args.out)
 
     if args.color == "auto":
         color_mode = "always" if sys.stdout.isatty() else "never"
@@ -462,8 +547,8 @@ def main():
     use_rrel_for_blue = (args.blue_by == "Rrel")
     blue_threshold = args.blue_threshold if blue_mode else 0.0
 
-    rows_train, ravg_train, total_train, dt_train = build_rows_from_csv(per_batch_csv, per_epoch_csv, "train")
-    rows_val, ravg_val, total_val, dt_val = build_rows_from_csv(per_batch_csv, per_epoch_csv, "val")
+    rows_train, ravg_train, total_train, dt_train, prog_train = build_rows_from_csv(per_batch_csv, per_epoch_csv, per_progress_csv, "train")
+    rows_val, ravg_val, total_val, dt_val, prog_val = build_rows_from_csv(per_batch_csv, per_epoch_csv, per_progress_csv, "val")
 
     def compute_totals(rows, dt_map):
         dts = []
@@ -484,8 +569,9 @@ def main():
             comp_total, ravg_from_batches = compute_total_from_batches(rows)
             r_avg = ravg_train.get(ep, 0.0) or ravg_from_batches
             dt_map, total_dt_avg, total_elapsed_str = compute_totals(rows, dt_train.get(ep, {}))
+            prog_map = prog_train.get(ep, {})
             total_row = comp_total if comp_total is not None else total_train.get(ep, None)
-            print_epoch_table("TRAIN", ep, rows, r_avg, dt_map,
+            print_epoch_table("TRAIN", ep, rows, r_avg, dt_map, prog_map,
                               color_mode, blue_mode, blue_threshold, use_rrel_for_blue,
                               total_row, total_dt_avg, total_elapsed_str)
         if ep in rows_val:
@@ -493,8 +579,9 @@ def main():
             comp_total, ravg_from_batches = compute_total_from_batches(rows)
             r_avg = ravg_val.get(ep, 0.0) or ravg_from_batches
             dt_map, total_dt_avg, total_elapsed_str = compute_totals(rows, dt_val.get(ep, {}))
+            prog_map = prog_val.get(ep, {})
             total_row = comp_total if comp_total is not None else total_val.get(ep, None)
-            print_epoch_table("VAL", ep, rows, r_avg, dt_map,
+            print_epoch_table("VAL", ep, rows, r_avg, dt_map, prog_map,
                               color_mode, blue_mode, blue_threshold, use_rrel_for_blue,
                               total_row, total_dt_avg, total_elapsed_str)
 

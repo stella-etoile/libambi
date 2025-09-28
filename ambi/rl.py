@@ -1,5 +1,9 @@
 from __future__ import annotations
 import math, gc, os, time
+os.environ.setdefault("OMP_NUM_THREADS","1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
+os.environ.setdefault("MKL_NUM_THREADS","1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -8,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import psutil
 from ambi.io import load_image_rgb, rgb_to_ycbcr, BitWriter, fixed_quadtree_leaves
 from ambi.core import quantize, dequantize, hash_prefix
@@ -17,7 +21,6 @@ from ambi.models import DeterministicPrior
 from ambi.partition import dynamic_quadtree_leaves
 from ambi.compress import choose_compressor, COMP_NONE, COMP_ZLIB
 from ambi.distortion import ssim, ms_ssim
-
 import ctypes
 
 try:
@@ -45,6 +48,36 @@ if os.environ.get("AMBI_NOPROGRESS", "") == "1":
         return _NoTqdm()
 else:
     from tqdm.auto import tqdm
+
+class ProgressPrinter:
+    def __init__(self, total: int, pct_step: float, label: str):
+        self.total = max(1, int(total))
+        self.step = float(max(0.1, float(pct_step))) if float(pct_step) > 0 else 0.0
+        self.label = str(label)
+        self.start = time.perf_counter()
+        self.next = self.step if self.step > 0 else 101.0
+        self.enabled = self.step > 0
+
+    def update(self, done: int):
+        if not self.enabled:
+            return
+        pct = 100.0 * float(done) / float(self.total)
+        while pct + 1e-9 >= self.next and self.next <= 100.0:
+            elapsed = time.perf_counter() - self.start
+            print(f"[PROGRESS] {self.label} {self.next:.0f}% ({int(done)}/{self.total}) elapsed={elapsed:.2f}s")
+            self.next += self.step
+
+    def done(self, done: Optional[int] = None, reason: Optional[str] = None):
+        """Finalize progress. If 'done' is provided (< total), print true % instead of 100%."""
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self.start
+        if done is None or done >= self.total:
+            print(f"[PROGRESS] {self.label} 100% ({self.total}/{self.total}) elapsed={elapsed:.2f}s")
+        else:
+            pct = 100.0 * float(done) / float(self.total)
+            extra = f" ({reason})" if reason else ""
+            print(f"[PROGRESS] {self.label} {pct:.0f}% ({int(done)}/{self.total}) elapsed={elapsed:.2f}s{extra}")
 
 Q_BINS = list(range(8, 33, 2))
 K_BINS = [1, 2, 3, 4, 5, 6]
@@ -319,9 +352,10 @@ class AMBIEnv:
         else:
             ref_eval = np.clip(b, 0, 1)
             rec_eval = np.clip(cands[best], 0, 1)
-        ssim_val = float(ssim(ref_eval, rec_eval, on=on))
         msssim_val = float(ms_ssim(ref_eval, rec_eval, on=on))
-        gmsd_val = float(gmsd(ref_eval, rec_eval, on=on))
+        gmsd_val = 0.0
+        if float(self.cfg.lamb_gmsd or 0.0) > 0.0:
+            gmsd_val = float(gmsd(ref_eval, rec_eval, on=on))
         a_bpp = float(getattr(self, "_alpha_bpp", 1.0))
         a_psnr = float(getattr(self, "_alpha_psnr", 1.0))
         a_mss = float(getattr(self, "_alpha_msssim", 1.0))
@@ -334,7 +368,7 @@ class AMBIEnv:
         R = a_bpp * bpp + a_psnr * pen_psnr + a_mss * pen_mss
         reward = -float(R)
         info = {
-            "bpp": bpp, "mse": mse, "ssim": ssim_val, "msssim": msssim_val, "gmsd": gmsd_val,
+            "bpp": bpp, "mse": mse, "ssim": 1.0, "msssim": msssim_val, "gmsd": gmsd_val,
             "q": Q_BINS.index(q) if q in Q_BINS else q,
             "K": K, "H": H, "split": 0,
             "reward": reward, "score": -reward,
@@ -439,28 +473,29 @@ class PPOCfg:
     env_workers: Optional[int] = None
 
 class PPOTrainer:
-    def __init__(self, obs_dim: int, cfg: PPOCfg, control_split: bool):
+    def __init__(self, obs_dim: int, cfg: PPOCfg, control_split: bool, progress_pct: float = 0.0):
         self.cfg = cfg
         self.obs_dim = int(obs_dim)
         self.control_split = bool(control_split)
+        self.progress_pct = float(progress_pct)
         self.net = PolicyNet(self.obs_dim, self.control_split).to(cfg.device)
         self.opt = optim.Adam(self.net.parameters(), lr=cfg.lr)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(cfg.device == "cuda" and getattr(cfg, "use_amp", True)))
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
 
     def _gather(self, envs: List[AMBIEnv], steps: int):
         obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
         info_buf: List[Dict[str, Any]] = []
         n_envs = len(envs)
-        n_workers = int(self.cfg.env_workers or n_envs)
         states = [env.reset() for env in envs]
         states_t = torch.as_tensor(np.stack(states), dtype=torch.float32, device=self.cfg.device)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool, \
-             tqdm(total=steps, desc="RL rollout", unit="step", leave=False) as pbar:
-            def _step_one(i_env: int, action_tuple):
-                ns, r, d, info = envs[i_env].step(action_tuple)
-                if d:
-                    ns = envs[i_env].reset()
-                return i_env, ns, r, d, info
-            for _ in range(steps):
+        pp = ProgressPrinter(steps, self.progress_pct, "rollout")
+        with tqdm(total=steps, desc="RL rollout", unit="step", leave=False) as pbar:
+            for t in range(steps):
                 if self.control_split:
                     logit_split, lq, lk, lh, v = self.net.forward(states_t)
                     pi_split = torch.distributions.Bernoulli(logits=logit_split)
@@ -483,12 +518,10 @@ class PPOTrainer:
                     next_states = [None] * n_envs
                     rewards = np.zeros((n_envs,), dtype=np.float32)
                     dones = np.zeros((n_envs,), dtype=bool)
-                    futures = [
-                        pool.submit(_step_one, i, (int(split_np[i]), int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
-                        for i in range(n_envs)
-                    ]
-                    for f in as_completed(futures):
-                        i, ns, r, d, info = f.result()
+                    for i in range(n_envs):
+                        ns, r, d, info = envs[i].step((int(split_np[i]), int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
+                        if d:
+                            ns = envs[i].reset()
                         next_states[i] = ns; rewards[i] = r; dones[i] = d; info_buf.append(info)
                     obs_buf.append(np.stack(states))
                     act_buf.append(np.stack([split_np, q_idx, k_idx, h_idx], axis=1))
@@ -496,6 +529,12 @@ class PPOTrainer:
                     val_buf.append(vals)
                     rew_buf.append(rewards)
                     done_buf.append(dones)
+                    try:
+                        pbar.set_postfix_str(
+                            f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}, split~{float(np.mean(split_np)):.2f}"
+                        )
+                    except Exception:
+                        pass
                 else:
                     _none, lq, lk, lh, v = self.net.forward(states_t)
                     piq = torch.distributions.Categorical(logits=lq)
@@ -511,10 +550,10 @@ class PPOTrainer:
                     next_states = [None] * n_envs
                     rewards = np.zeros((n_envs,), dtype=np.float32)
                     dones = np.zeros((n_envs,), dtype=bool)
-                    futures = [pool.submit(_step_one, i, (int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
-                               for i in range(n_envs)]
-                    for f in as_completed(futures):
-                        i, ns, r, d, info = f.result()
+                    for i in range(n_envs):
+                        ns, r, d, info = envs[i].step((int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
+                        if d:
+                            ns = envs[i].reset()
                         next_states[i] = ns; rewards[i] = r; dones[i] = d; info_buf.append(info)
                     obs_buf.append(np.stack(states))
                     act_buf.append(np.stack([q_idx, k_idx, h_idx], axis=1))
@@ -522,20 +561,17 @@ class PPOTrainer:
                     val_buf.append(vals)
                     rew_buf.append(rewards)
                     done_buf.append(dones)
-                states = next_states
-                states_t = torch.as_tensor(np.stack(states), dtype=torch.float32, device=self.cfg.device)
-                if info_buf and ("bpp" in info_buf[-1] or "mse" in info_buf[-1]):
-                    last = info_buf[-1]
                     try:
-                        psnr = last.get("psnr", 10.0 * math.log10(1.0 / max(last.get("mse", 1e-12), 1e-12)))
                         pbar.set_postfix_str(
-                            f"split={last.get('split',0)}, bpp={last.get('bpp',0):.3f}, "
-                            f"PSNR={psnr:.2f}, SSIM={last.get('ssim',0):.3f}, "
-                            f"MS={last.get('msssim',0):.3f}, GMSD={last.get('gmsd',0):.4f}"
+                            f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}"
                         )
                     except Exception:
                         pass
+                states = next_states
+                states_t = torch.as_tensor(np.stack(states), dtype=torch.float32, device=self.cfg.device)
                 pbar.update(1)
+                pp.update(t+1)
+        pp.done()
         obs = torch.as_tensor(np.concatenate(obs_buf, axis=0), dtype=torch.float32, device=self.cfg.device)
         act = torch.as_tensor(np.concatenate(act_buf, axis=0), dtype=torch.long, device=self.cfg.device)
         logp_old = torch.as_tensor(np.concatenate(logp_buf, axis=0), dtype=torch.float32, device=self.cfg.device)
@@ -561,61 +597,127 @@ class PPOTrainer:
         cfg = self.cfg
         n = obs.shape[0]
         idx = np.arange(n)
+        use_amp = (cfg.device == "cuda")
+        if use_amp and not hasattr(self, "scaler"):
+            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        self.net.train()
         with tqdm(total=cfg.epochs, desc="PPO epochs", unit="epoch", leave=False) as epbar:
             for e in range(cfg.epochs):
                 np.random.shuffle(idx)
                 num_batches = int(math.ceil(n / cfg.minibatch))
+                pp_mb = ProgressPrinter(num_batches, self.progress_pct, f"update e{e+1}")
                 with tqdm(total=num_batches, desc=f"epoch {e+1}/{cfg.epochs} (minibatches)", unit="mb", leave=False) as mbbar:
                     s = 0
+                    first_debug_print_done = False
+                    b_done = 0
                     while s < n:
                         mb = idx[s:s+cfg.minibatch]
                         mb_obs = obs[mb]
                         mb_logp_old = logp_old[mb]
                         mb_adv = adv[mb]
                         mb_ret = ret[mb]
-                        if self.control_split:
-                            mb_act = act[mb]
-                            logit_split, lq, lk, lh, v = self.net.forward(mb_obs)
-                            pi_split = torch.distributions.Bernoulli(logits=logit_split)
-                            piq = torch.distributions.Categorical(logits=lq)
-                            pik = torch.distributions.Categorical(logits=lk)
-                            pih = torch.distributions.Categorical(logits=lh)
-                            a_split = mb_act[:, 0].float()
-                            a_q = mb_act[:, 1]
-                            a_k = mb_act[:, 2]
-                            a_h = mb_act[:, 3]
-                            keep_mask = (1.0 - a_split)
-                            logp = (pi_split.log_prob(a_split)
-                                    + (piq.log_prob(a_q) + pik.log_prob(a_k) + pih.log_prob(a_h)) * keep_mask)
-                            ratio = torch.exp(logp - mb_logp_old)
-                            surr1 = ratio * mb_adv
-                            surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
-                            policy_loss = -torch.min(surr1, surr2).mean()
-                            value_loss = ((v - mb_ret) ** 2).mean()
-                            entropy = (pi_split.entropy() + (piq.entropy() + pik.entropy() + pih.entropy()) * keep_mask).mean()
-                            loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                        if use_amp:
+                            with torch.cuda.amp.autocast():
+                                if self.control_split:
+                                    mb_act = act[mb]
+                                    logit_split, lq, lk, lh, v = self.net.forward(mb_obs)
+                                    pi_split = torch.distributions.Bernoulli(logits=logit_split)
+                                    piq = torch.distributions.Categorical(logits=lq)
+                                    pik = torch.distributions.Categorical(logits=lk)
+                                    pih = torch.distributions.Categorical(logits=lh)
+                                    a_split = mb_act[:, 0].float()
+                                    a_q = mb_act[:, 1]
+                                    a_k = mb_act[:, 2]
+                                    a_h = mb_act[:, 3]
+                                    keep_mask = (1.0 - a_split)
+                                    logp = (pi_split.log_prob(a_split)
+                                            + (piq.log_prob(a_q) + pik.log_prob(a_k) + pih.log_prob(a_h)) * keep_mask)
+                                    ratio = torch.exp(logp - mb_logp_old)
+                                    surr1 = ratio * mb_adv
+                                    surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
+                                    policy_loss = -torch.min(surr1, surr2).mean()
+                                    value_loss = ((v - mb_ret) ** 2).mean()
+                                    entropy = (pi_split.entropy() + (piq.entropy() + pik.entropy() + pih.entropy()) * keep_mask).mean()
+                                    loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                                else:
+                                    mb_act = act[mb]
+                                    _none, lq, lk, lh, v = self.net.forward(mb_obs)
+                                    piq = torch.distributions.Categorical(logits=lq)
+                                    pik = torch.distributions.Categorical(logits=lk)
+                                    pih = torch.distributions.Categorical(logits=lh)
+                                    logp = piq.log_prob(mb_act[:, 0]) + pik.log_prob(mb_act[:, 1]) + pih.log_prob(mb_act[:, 2])
+                                    ratio = torch.exp(logp - mb_logp_old)
+                                    surr1 = ratio * mb_adv
+                                    surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
+                                    policy_loss = -torch.min(surr1, surr2).mean()
+                                    value_loss = ((v - mb_ret) ** 2).mean()
+                                    entropy = (piq.entropy() + pik.entropy() + pih.entropy()).mean()
+                                    loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
                         else:
-                            mb_act = act[mb]
-                            _none, lq, lk, lh, v = self.net.forward(mb_obs)
-                            piq = torch.distributions.Categorical(logits=lq)
-                            pik = torch.distributions.Categorical(logits=lk)
-                            pih = torch.distributions.Categorical(logits=lh)
-                            logp = piq.log_prob(mb_act[:, 0]) + pik.log_prob(mb_act[:, 1]) + pih.log_prob(mb_act[:, 2])
-                            ratio = torch.exp(logp - mb_logp_old)
-                            surr1 = ratio * mb_adv
-                            surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
-                            policy_loss = -torch.min(surr1, surr2).mean()
-                            value_loss = ((v - mb_ret) ** 2).mean()
-                            entropy = (piq.entropy() + pik.entropy() + pih.entropy()).mean()
-                            loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
-                        self.opt.zero_grad()
-                        loss.backward()
-                        nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
-                        self.opt.step()
-                        mbbar.set_postfix_str(f"loss={loss.item():.4f}, V={v.mean().item():.3f}")
+                            if self.control_split:
+                                mb_act = act[mb]
+                                logit_split, lq, lk, lh, v = self.net.forward(mb_obs)
+                                pi_split = torch.distributions.Bernoulli(logits=logit_split)
+                                piq = torch.distributions.Categorical(logits=lq)
+                                pik = torch.distributions.Categorical(logits=lk)
+                                pih = torch.distributions.Categorical(logits=lh)
+                                a_split = mb_act[:, 0].float()
+                                a_q = mb_act[:, 1]
+                                a_k = mb_act[:, 2]
+                                a_h = mb_act[:, 3]
+                                keep_mask = (1.0 - a_split)
+                                logp = (pi_split.log_prob(a_split)
+                                        + (piq.log_prob(a_q) + pik.log_prob(a_k) + pih.log_prob(a_h)) * keep_mask)
+                                ratio = torch.exp(logp - mb_logp_old)
+                                surr1 = ratio * mb_adv
+                                surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
+                                policy_loss = -torch.min(surr1, surr2).mean()
+                                value_loss = ((v - mb_ret) ** 2).mean()
+                                entropy = (pi_split.entropy() + (piq.entropy() + pik.entropy() + pih.entropy()) * keep_mask).mean()
+                                loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                            else:
+                                mb_act = act[mb]
+                                _none, lq, lk, lh, v = self.net.forward(mb_obs)
+                                piq = torch.distributions.Categorical(logits=lq)
+                                pik = torch.distributions.Categorical(logits=lk)
+                                pih = torch.distributions.Categorical(logits=lh)
+                                logp = piq.log_prob(mb_act[:, 0]) + pik.log_prob(mb_act[:, 1]) + pih.log_prob(mb_act[:, 2])
+                                ratio = torch.exp(logp - mb_logp_old)
+                                surr1 = ratio * mb_adv
+                                surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * mb_adv
+                                policy_loss = -torch.min(surr1, surr2).mean()
+                                value_loss = ((v - mb_ret) ** 2).mean()
+                                entropy = (piq.entropy() + pik.entropy() + pih.entropy()).mean()
+                                loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                        if not first_debug_print_done:
+                            dev = mb_obs.device
+                            if dev.type == "cuda":
+                                torch.cuda.synchronize()
+                                mem = torch.cuda.memory_allocated() / (1024**2)
+                                print(f"[DEBUG] PPO update on {dev}, cuda_mem_allocated={mem:.1f} MB")
+                            else:
+                                print(f"[DEBUG] PPO update on {dev}")
+                            first_debug_print_done = True
+                        self.opt.zero_grad(set_to_none=True)
+                        if use_amp:
+                            self.scaler.scale(loss).backward()
+                            nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                            self.scaler.step(self.opt)
+                            self.scaler.update()
+                        else:
+                            loss.backward()
+                            nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                            self.opt.step()
+                        if torch.isnan(loss):
+                            print("[WARN] NaN loss detected; skipping step.")
+                            self.opt.zero_grad(set_to_none=True)
+                        mbbar.set_postfix_str(f"loss={float(loss):.4f}, V={float(v.mean()):.3f}")
                         mbbar.update(1)
                         s += cfg.minibatch
+                        b_done += 1
+                        pp_mb.update(b_done)
                 epbar.update(1)
+                pp_mb.done()
 
     def save_torchscript(self, path: Path):
         self.net.eval()
@@ -630,6 +732,12 @@ def list_image_paths(root: Path) -> List[Path]:
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
     return [p for p in sorted(root.rglob("*")) if p.suffix.lower() in exts]
 
+def _load_plus_aug(args):
+    p, aug_kinds, aug_per_image = args
+    img = load_image_rgb(p)
+    augs = make_augs(img, aug_kinds, aug_per_image)
+    return [img] + augs
+
 class ImageBatcher:
     def __init__(
         self,
@@ -641,7 +749,9 @@ class ImageBatcher:
         aug_per_image: int = 3,
         aug_kinds: Optional[List[str]] = None,
         shuffle_seed: int = 0,
-        cached_imgs: Optional[List[np.ndarray]] = None
+        cached_imgs: Optional[List[np.ndarray]] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
+        progress_pct: float = 0.0,   # NEW
     ):
         self.paths = list(paths)
         self.mode = mode
@@ -653,16 +763,30 @@ class ImageBatcher:
         self.shuffle_seed = int(shuffle_seed)
         self._i = 0
         self._cache: Optional[List[np.ndarray]] = None
+        self.io_workers = int(os.environ.get("AMBI_IO_WORKERS", "8"))
+        self._ext_executor = executor
+        self.progress_pct = float(progress_pct)  # NEW
+
         if cached_imgs is not None:
             self._cache = list(cached_imgs)
         elif self.mode.lower() == "eager":
             rng = np.random.default_rng(self.shuffle_seed)
-            imgs: List[np.ndarray] = []
-            for p in self.paths:
-                img = load_image_rgb(p)
-                imgs.append(img)
-                augs = make_augs(img, self.aug_kinds, self.aug_per_image)
-                imgs.extend(augs)
+            pool = self._ext_executor or ThreadPoolExecutor(max_workers=self.io_workers)
+            try:
+                imgs = []
+                total = len(self.paths)
+                pp = ProgressPrinter(total, self.progress_pct, "load (eager)")
+                for i, group in enumerate(
+                    pool.map(_load_plus_aug, [(p, self.aug_kinds, self.aug_per_image) for p in self.paths]),
+                    start=1
+                ):
+                    imgs.extend(group)
+                    pp.update(i)
+                pp.done()
+            finally:
+                if self._ext_executor is None:
+                    pool.shutdown(wait=True)
+                    malloc_trim()
             if len(imgs) > 1:
                 rng.shuffle(imgs)
             self._cache = imgs
@@ -679,28 +803,48 @@ class ImageBatcher:
             batch = self._cache[self._i:j]
             self._i = j
             return batch
+
         if self._i >= len(self.paths):
             raise StopIteration
+
         if self.mode == "count":
             j = min(self._i + self.batch_size, len(self.paths))
             batch_paths = self.paths[self._i:j]
-            imgs: List[np.ndarray] = []
-            for p in batch_paths:
-                img = load_image_rgb(p)
-                imgs.append(img)
-                augs = make_augs(img, self.aug_kinds, self.aug_per_image)
-                imgs.extend(augs)
             self._i = j
-            if not imgs:
+            if not batch_paths:
                 raise StopIteration
+            imgs: List[np.ndarray] = []
+            pool = self._ext_executor or ThreadPoolExecutor(max_workers=self.io_workers)
+            try:
+                total = len(batch_paths)
+                pp = ProgressPrinter(total, self.progress_pct, "load (count)")
+                for i, group in enumerate(
+                    pool.map(_load_plus_aug, [(p, self.aug_kinds, self.aug_per_image) for p in batch_paths]),
+                    start=1
+                ):
+                    imgs.extend(group)
+                    pp.update(i)
+                pp.done()
+            finally:
+                if self._ext_executor is None:
+                    pool.shutdown(wait=True)
+                    malloc_trim()
             if len(imgs) > 1:
                 rng = np.random.default_rng(self.shuffle_seed)
                 rng.shuffle(imgs)
             return imgs
+
+        # memory-based lazy loading
         avail0 = psutil.virtual_memory().available
         budget = max(128*1024*1024, int(avail0 * self.mem_fraction))
         imgs: List[np.ndarray] = []
         used = 0
+
+        total = len(self.paths) - self._i
+        pp = ProgressPrinter(max(1, total), self.progress_pct, "load (mem)")
+        before_i = self._i
+        loaded = 0
+
         while self._i < len(self.paths):
             p = self.paths[self._i]
             img = load_image_rgb(p)
@@ -711,55 +855,59 @@ class ImageBatcher:
             augs = make_augs(img, self.aug_kinds, self.aug_per_image)
             for a in augs:
                 need += int(a.nbytes)
+
             if used + need > budget or vm.available < soft_guard:
                 if len(imgs) == 0:
                     imgs.append(img)
                     imgs.extend(augs[:max(0, (budget - est) // max(1, est))])
                     self._i += 1
+                    loaded += 1
                 break
+
             imgs.append(img)
             imgs.extend(augs)
             used += need
             self._i += 1
+            loaded += 1
+            pp.update(loaded)  # per path this call consumed
+
         if not imgs:
+            pp.done(loaded, reason="no images fit")
             raise StopIteration
+
         if len(imgs) > 1:
             rng = np.random.default_rng(self.shuffle_seed)
             rng.shuffle(imgs)
+
+        pp.done(loaded, reason="batch memory limit")
         return imgs
 
-def preload_all_images(paths: List[Path], aug_kinds: List[str], aug_per_image: int, seed: int) -> List[np.ndarray]:
+def preload_all_images(
+    paths: List[Path],
+    aug_kinds: List[str],
+    aug_per_image: int,
+    seed: int,
+    io_workers: int = 8,
+    executor: Optional[ThreadPoolExecutor] = None,
+    progress_pct: float = 0.0,   # NEW
+) -> List[np.ndarray]:
     rng = np.random.default_rng(seed)
     imgs: List[np.ndarray] = []
-    for p in paths:
-        img = load_image_rgb(p)
-        imgs.append(img)
-        augs = make_augs(img, aug_kinds, aug_per_image)
-        imgs.extend(augs)
+    pool = executor or ThreadPoolExecutor(max_workers=io_workers)
+    try:
+        total = len(paths)
+        pp = ProgressPrinter(total, progress_pct, "preload")
+        for i, group in enumerate(pool.map(_load_plus_aug, [(p, aug_kinds, aug_per_image) for p in paths]), start=1):
+            imgs.extend(group)
+            pp.update(i)
+        pp.done()
+    finally:
+        if executor is None:
+            pool.shutdown(wait=True)
+            malloc_trim()
     if len(imgs) > 1:
         rng.shuffle(imgs)
     return imgs
-
-def build_envs(imgs: List[np.ndarray], cfg: EnvCfg, n_envs: int) -> List[AMBIEnv]:
-    probe = AMBIEnv(imgs[0], cfg)
-    shared_dim = probe.obs_dim
-    cfg2 = replace(cfg, obs_dim=shared_dim)
-    envs = [AMBIEnv(imgs[i % len(imgs)], cfg2) for i in range(n_envs)]
-    for e in envs:
-        for name, default in (
-            ("_WBPP", 1.0),
-            ("_WPSNR", 1.0),
-            ("_alpha_bpp", 1.0),
-            ("_alpha_psnr", 1.0),
-            ("_alpha_msssim", 1.0),
-            ("_bpp_cuts", None),
-            ("_psnr_cuts", None),
-            ("_bpp_weights", (1.0, 1.0, 1.0)),
-            ("_psnr_weights", (1.0, 1.0, 1.0)),
-            ("_alpha_mismatch", 0.0),
-        ):
-            setattr(e, name, getattr(cfg, name, default))
-    return envs
 
 @dataclass
 class LoadingCfg:
@@ -771,6 +919,7 @@ class LoadingCfg:
     aug_per_image: int = 3
     aug_kinds: Optional[List[str]] = None
     shuffle_seed: int = 0
+    io_workers: int = 8
 
 @dataclass
 class EarlyStopCfg:
@@ -803,7 +952,26 @@ class EarlyStopper:
             self.wait += 1
         return (self.wait >= self.cfg.patience), bpp_imp, db_imp
 
-def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCfg, n_envs: int, ppo_cfg: PPOCfg, paths_val: List[Path], it: int, iters: int) -> Tuple[Optional[float], Optional[float]]:
+def build_envs(imgs: List[np.ndarray], cfg: EnvCfg, n_envs: int, env_workers: int = 8) -> List[AMBIEnv]:
+    probe = AMBIEnv(imgs[0], cfg)
+    shared_dim = probe.obs_dim
+    cfg2 = replace(cfg, obs_dim=shared_dim)
+    def _mk(i):
+        e = AMBIEnv(imgs[i % len(imgs)], cfg2)
+        for name, default in (
+            ("_WBPP", 1.0), ("_WPSNR", 1.0),
+            ("_alpha_bpp", 1.0), ("_alpha_psnr", 1.0), ("_alpha_msssim", 1.0),
+            ("_bpp_cuts", None), ("_psnr_cuts", None),
+            ("_bpp_weights", (1.0, 1.0, 1.0)), ("_psnr_weights", (1.0, 1.0, 1.0)),
+            ("_alpha_mismatch", 0.0),
+        ):
+            setattr(e, name, getattr(cfg, name, default))
+        return e
+    with ThreadPoolExecutor(max_workers=env_workers) as pool:
+        envs = list(pool.map(_mk, range(n_envs)))
+    return envs
+
+def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCfg, n_envs: int, ppo_cfg: PPOCfg, paths_val: List[Path], it: int, iters: int, shared_executor: Optional[ThreadPoolExecutor]) -> Tuple[Optional[float], Optional[float]]:
     if not paths_val:
         print("[VAL] no images found, skipping")
         return None, None
@@ -817,7 +985,9 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         mem_fraction=loading_cfg.mem_fraction,
         aug_per_image=loading_cfg.aug_per_image,
         aug_kinds=loading_cfg.aug_kinds,
-        shuffle_seed=loading_cfg.shuffle_seed + it
+        shuffle_seed=loading_cfg.shuffle_seed + it,
+        executor=shared_executor,
+        progress_pct=getattr(trainer, "progress_pct", 0.0),  # NEW
     )
     if batcher.mode == "count":
         num_batches = math.ceil(len(paths_val) / batcher.batch_size)
@@ -844,6 +1014,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         budget0 = max(128 * 1024 * 1024, int(vm0.available * loading_cfg.mem_fraction))
         est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
         num_batches = max(1, math.ceil(len(paths_val) / est_units_per_batch0))
+    pp_val = ProgressPrinter(num_batches, getattr(trainer, "progress_pct", 0.0), f"val epoch {it+1}")
     batch_idx = 0
     val_epoch_start = time.perf_counter()
     for imgs in batcher:
@@ -851,7 +1022,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         batch_start = time.perf_counter()
         approx_tag = "" if batcher.mode == "count" else "~"
         print(f"[Epoch {it+1}/{iters}] VAL {batch_idx}/{approx_tag}{num_batches}")
-        envs = build_envs(imgs, env_cfg, n_envs)
+        envs = build_envs(imgs, env_cfg, n_envs, env_workers=loading_cfg.io_workers)
         obs, act, logp_old, adv, ret, info = trainer._gather(envs, ppo_cfg.steps_per_iter)
         vals = [i for i in info if "bpp" in i and "mse" in i]
         if vals:
@@ -875,11 +1046,13 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
             )
         batch_elapsed = time.perf_counter() - batch_start
         print(f"[Epoch {it+1}/{iters}] VAL-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
+        pp_val.update(batch_idx)
         del envs, imgs, obs, act, logp_old, adv, ret, info
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         malloc_trim()
+    pp_val.done()
     total_val_elapsed = time.perf_counter() - val_epoch_start
     if epoch_vals:
         bpp_vals = [v["bpp"] for v in epoch_vals]
@@ -938,7 +1111,7 @@ def train_rl(
         split_grad_thresh=float(split.get("grad_thresh", 0.02)) if split else None,
         target_bpp=float(yaml_cfg.get("policy", {}).get("target_bpp", 0.6)),
         version=int(fmt.get("version", 3)),
-        compression=enc.get("compression", {"type": "zlib", "level": 6}),
+        compression=enc.get("compression", {"type": "none"}),
         lamb_r=float(w.get("rate", rl.get("lamb_r", 1.0))),
         lamb_d=float(w.get("mse", rl.get("lamb_d", 200.0))),
         lamb_ssim=float(w.get("ssim", rl.get("lamb_ssim", 50.0))),
@@ -966,13 +1139,16 @@ def train_rl(
     alpha_psnr_base   = float(w.get("alpha_psnr", 1.0))
     alpha_msssim      = float(w.get("alpha_msssim", 1.0))
     alpha_mismatch = float(w.get("alpha_mismatch", 0.0))
+    progress_pct = float(rl.get("progress_pct", 0.0))
     WBPP  = bpp_q1 + bpp_med + bpp_q3
     WPSNR = psnr_q1 + psnr_med + psnr_q3
+
     paths = list_image_paths(data_root)
     if not paths:
         raise ValueError("No images found for RL dataset.")
     probe_img = load_image_rgb(paths[0])
     env_probe = AMBIEnv(probe_img, env_cfg)
+
     setattr(env_cfg, "_WBPP", WBPP)
     setattr(env_cfg, "_WPSNR", WPSNR)
     setattr(env_cfg, "_alpha_bpp", alpha_bpp_base)
@@ -981,8 +1157,16 @@ def train_rl(
     setattr(env_cfg, "_alpha_mismatch", alpha_mismatch)
     setattr(env_cfg, "_bpp_weights", (bpp_q1, bpp_med, bpp_q3))
     setattr(env_cfg, "_psnr_weights", (psnr_q1, psnr_med, psnr_q3))
+
     obs_dim = int(env_probe.obs_dim)
-    trainer = PPOTrainer(obs_dim, ppo_cfg, control_split=env_cfg.control_split)
+    trainer = PPOTrainer(obs_dim, ppo_cfg, control_split=env_cfg.control_split, progress_pct=progress_pct)
+
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
     loading_cfg = LoadingCfg(
         mode=str(rl.get("loading", {}).get("mode", "eager")),
         lazy_by=str(rl.get("loading", {}).get("lazy_by", "count")),
@@ -992,7 +1176,9 @@ def train_rl(
         aug_per_image=int(rl.get("loading", {}).get("aug_per_image", 3)),
         aug_kinds=list(rl.get("loading", {}).get("aug_kinds", ["hflip", "vflip", "rot90"])),
         shuffle_seed=int(rl.get("loading", {}).get("shuffle_seed", 0)),
+        io_workers=int(rl.get("loading", {}).get("io_workers", 8)),
     )
+
     es_raw = (yaml_cfg.get("rl", {}) or {}).get("early_stop", {}) if yaml_cfg else {}
     early_cfg = EarlyStopCfg(
         enabled=bool(es_raw.get("enabled", False)),
@@ -1002,186 +1188,224 @@ def train_rl(
         start_after=int(es_raw.get("start_after", 0)),
     )
     stopper = EarlyStopper(early_cfg)
+
     alpha_bpp_cur = float(alpha_bpp_base)
     alpha_psnr_cur = float(alpha_psnr_base)
     env_cfg._alpha_bpp = alpha_bpp_cur
     env_cfg._alpha_psnr = alpha_psnr_cur
+
     use_eager = loading_cfg.mode.lower() == "eager"
     keep_cache = bool(rl.get("loading", {}).get("keep_cache", True))
     cached_imgs: Optional[List[np.ndarray]] = None
-    if use_eager and keep_cache:
-        cached_imgs = preload_all_images(
-            paths,
-            aug_kinds=loading_cfg.aug_kinds,
-            aug_per_image=loading_cfg.aug_per_image,
-            seed=loading_cfg.shuffle_seed
-        )
-    val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_2923")
-    val_paths = list_image_paths(val_root)
+    shared_executor = ThreadPoolExecutor(max_workers=loading_cfg.io_workers)
 
-    for it in range(iters):
-        epoch_start = time.perf_counter()
-        epoch_vals: List[Dict[str, float]] = []
-        if use_eager and keep_cache and cached_imgs is not None:
-            batcher = ImageBatcher(
-                paths=[],
-                mode="eager",
-                batch_size=loading_cfg.batch_size,
-                mem_fraction=loading_cfg.mem_fraction,
-                aug_per_image=loading_cfg.aug_per_image,
-                aug_kinds=loading_cfg.aug_kinds,
-                shuffle_seed=loading_cfg.shuffle_seed + it,
-                cached_imgs=cached_imgs
-            )
-            num_batches = math.ceil(len(cached_imgs) / loading_cfg.batch_size)
-        else:
-            mem_mode2 = "memory" if loading_cfg.mode.lower() == "lazy" and loading_cfg.lazy_by.lower().startswith("mem") else "count"
-            batcher = ImageBatcher(
+    try:
+        if use_eager and keep_cache:
+            cached_imgs = preload_all_images(
                 paths,
-                mode=mem_mode2 if loading_cfg.mode.lower() == "lazy" else "count",
-                batch_size=loading_cfg.batch_size,
-                mem_fraction=loading_cfg.mem_fraction,
-                aug_per_image=loading_cfg.aug_per_image,
                 aug_kinds=loading_cfg.aug_kinds,
-                shuffle_seed=loading_cfg.shuffle_seed + it
+                aug_per_image=loading_cfg.aug_per_image,
+                seed=loading_cfg.shuffle_seed,
+                io_workers=loading_cfg.io_workers,
+                executor=shared_executor,
+                progress_pct=progress_pct,  # NEW
             )
-            if batcher.mode == "count":
-                num_batches = math.ceil(len(paths) / batcher.batch_size)
+
+        val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_7306")
+        val_paths = list_image_paths(val_root)
+
+        for it in range(iters):
+            epoch_start = time.perf_counter()
+            epoch_vals: List[Dict[str, float]] = []
+
+            if use_eager and keep_cache and cached_imgs is not None:
+                batcher = ImageBatcher(
+                    paths=[],
+                    mode="eager",
+                    batch_size=loading_cfg.batch_size,
+                    mem_fraction=loading_cfg.mem_fraction,
+                    aug_per_image=loading_cfg.aug_per_image,
+                    aug_kinds=loading_cfg.aug_kinds,
+                    shuffle_seed=loading_cfg.shuffle_seed + it,
+                    cached_imgs=cached_imgs,
+                    executor=shared_executor,
+                    progress_pct=progress_pct,  # harmless (no loading)
+                )
+                num_batches = math.ceil(len(cached_imgs) / loading_cfg.batch_size)
             else:
-                sample_n = min(16, len(paths))
-                sample_imgs = []
-                try:
-                    for i in range(sample_n):
-                        img_i = load_image_rgb(paths[i])
-                        sample_imgs.append(img_i)
-                        augs_i = make_augs(img_i, loading_cfg.aug_kinds, loading_cfg.aug_per_image)
-                        sample_imgs.extend(augs_i)
-                    if sample_imgs:
-                        est_bytes_per_unit = sum(im.nbytes for im in sample_imgs) / float(len(sample_imgs))
-                    else:
-                        est_bytes_per_unit = 8 * 1024 * 1024
-                finally:
-                    del sample_imgs
+                mem_mode2 = "memory" if loading_cfg.mode.lower() == "lazy" and loading_cfg.lazy_by.lower().startswith("mem") else "count"
+                batcher = ImageBatcher(
+                    paths,
+                    mode=mem_mode2 if loading_cfg.mode.lower() == "lazy" else "count",
+                    batch_size=loading_cfg.batch_size,
+                    mem_fraction=loading_cfg.mem_fraction,
+                    aug_per_image=loading_cfg.aug_per_image,
+                    aug_kinds=loading_cfg.aug_kinds,
+                    shuffle_seed=loading_cfg.shuffle_seed + it,
+                    executor=shared_executor,
+                    progress_pct=progress_pct,  # NEW
+                )
+                if batcher.mode == "count":
+                    num_batches = math.ceil(len(paths) / batcher.batch_size)
+                else:
+                    sample_n = min(16, len(paths))
+                    sample_imgs = []
+                    try:
+                        for i in range(sample_n):
+                            img_i = load_image_rgb(paths[i])
+                            sample_imgs.append(img_i)
+                            augs_i = make_augs(img_i, loading_cfg.aug_kinds, loading_cfg.aug_per_image)
+                            sample_imgs.extend(augs_i)
+                        if sample_imgs:
+                            est_bytes_per_unit = sum(im.nbytes for im in sample_imgs) / float(len(sample_imgs))
+                        else:
+                            est_bytes_per_unit = 8 * 1024 * 1024
+                    finally:
+                        del sample_imgs
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    vm0 = psutil.virtual_memory()
+                    budget0 = max(128 * 1024 * 1024, int(vm0.available * loading_cfg.mem_fraction))
+                    est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
+                    num_batches = max(1, math.ceil(len(paths) / est_units_per_batch0))
+
+            pp_train = ProgressPrinter(num_batches, progress_pct, f"train epoch {it+1}")
+            batch_idx = 0
+
+            for imgs in batcher:
+                batch_idx += 1
+                batch_start = time.perf_counter()
+                approx_tag = "" if (use_eager and keep_cache and cached_imgs is not None) or batcher.mode == "count" else "~"
+                print(f"[Epoch {it+1}/{iters}] Batch {batch_idx}/{approx_tag}{num_batches}")
+
+                envs = build_envs(imgs, env_cfg, n_envs, env_workers=loading_cfg.io_workers)
+                batch_vals: List[Dict[str, float]] = []
+                inner = max(1, loading_cfg.iters_per_batch)
+
+                for _ in range(inner):
+                    obs, act, logp_old, adv, ret, info = trainer._gather(envs, ppo_cfg.steps_per_iter)
+                    vals = [i for i in info if "bpp" in i and "mse" in i]
+                    if vals:
+                        batch_vals.extend(vals)
+                        epoch_vals.extend(vals)
+                    trainer.update(obs, act, logp_old, adv, ret)
+                    del obs, act, logp_old, adv, ret, info
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                vm0 = psutil.virtual_memory()
-                budget0 = max(128 * 1024 * 1024, int(vm0.available * loading_cfg.mem_fraction))
-                est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
-                num_batches = max(1, math.ceil(len(paths) / est_units_per_batch0))
-        batch_idx = 0
-        for imgs in batcher:
-            batch_idx += 1
-            batch_start = time.perf_counter()
-            approx_tag = "" if (use_eager and keep_cache and cached_imgs is not None) or batcher.mode == "count" else "~"
-            print(f"[Epoch {it+1}/{iters}] Batch {batch_idx}/{approx_tag}{num_batches}")
-            envs = build_envs(imgs, env_cfg, n_envs)
-            batch_vals: List[Dict[str, float]] = []
-            inner = max(1, loading_cfg.iters_per_batch)
-            for _ in range(inner):
-                obs, act, logp_old, adv, ret, info = trainer._gather(envs, ppo_cfg.steps_per_iter)
-                vals = [i for i in info if "bpp" in i and "mse" in i]
-                if vals:
-                    batch_vals.extend(vals)
-                    epoch_vals.extend(vals)
-                trainer.update(obs, act, logp_old, adv, ret)
-            if batch_vals:
-                bpp_b = [v["bpp"] for v in batch_vals]
-                psnr_b = [v["psnr"] for v in batch_vals]
-                mss_b = [v["msssim"] for v in batch_vals]
-                stats_bpp_b = np.percentile(bpp_b, [0, 25, 50, 75, 100])
-                stats_psnr_b = np.percentile(psnr_b, [0, 25, 50, 75, 100])
-                avg_msssim_b = float(np.mean(mss_b))
-                psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_b[2] - env_cfg.psnr_margin_db)
-                mss_req_b = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-                pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(psnr_b)))
-                pen_mss_b = max(0.0, mss_req_b - avg_msssim_b)
-                avg_reward_b = -(env_cfg._alpha_bpp * float(np.mean(bpp_b)) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
-                print(
-                    f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  BATCH  "
-                    f"bpp=[{stats_bpp_b[0]:.3f}, {stats_bpp_b[1]:.3f}, {stats_bpp_b[2]:.3f}, {stats_bpp_b[3]:.3f}, {stats_bpp_b[4]:.3f}]  "
-                    f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
-                    f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
-                )
-                env_cfg._bpp_cuts = (float(stats_bpp_b[1]), float(stats_bpp_b[2]), float(stats_bpp_b[3]))
-                env_cfg._psnr_cuts = (float(stats_psnr_b[1]), float(stats_psnr_b[2]), float(stats_psnr_b[3]))
-            batch_elapsed = time.perf_counter() - batch_start
-            print(f"[Epoch {it+1}/{iters}] TRAIN-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
-            del envs, imgs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            malloc_trim()
+                    malloc_trim()
 
-        epoch_elapsed = time.perf_counter() - epoch_start
-        if epoch_vals:
-            bpp_vals = [v["bpp"] for v in epoch_vals]
-            psnr_vals = [v["psnr"] for v in epoch_vals]
-            msssim_vals = [v["msssim"] for v in epoch_vals]
-            med_bpp  = float(np.median(bpp_vals))
-            min_bpp  = float(np.min(bpp_vals))
-            max_bpp  = float(np.max(bpp_vals))
-            q1_bpp   = float(np.percentile(bpp_vals, 25))
-            q3_bpp   = float(np.percentile(bpp_vals, 75))
-            med_psnr = float(np.median(psnr_vals))
-            min_psnr = float(np.min(psnr_vals))
-            max_psnr = float(np.max(psnr_vals))
-            q1_psnr  = float(np.percentile(psnr_vals, 25))
-            q3_psnr  = float(np.percentile(psnr_vals, 75))
-            avg_msssim = float(np.mean(msssim_vals))
-            psnr_req_ep = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(med_psnr - env_cfg.psnr_margin_db)
-            mss_req_ep = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-            pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(psnr_vals)))
-            pen_mss_ep = max(0.0, mss_req_ep - avg_msssim)
-            W_total = -(env_cfg._alpha_bpp * float(np.mean(bpp_vals)) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
-            print(
-                f"[RL] iter {it+1}/{iters}  "
-                f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
-                f"PSNR_med={med_psnr:.2f} dB (min={min_psnr:.2f}, q1={q1_psnr:.2f}, q3={q3_psnr:.2f}, max={max_psnr:.2f})  "
-                f"MS-SSIM_avg={avg_msssim:.3f}  "
-                f"Wtotal={W_total:.3f}  "
-                f"TRAIN_epoch_elapsed={epoch_elapsed:.2f}s  "
-                f"alpha_bpp={env_cfg._alpha_bpp:.3f} alpha_psnr={env_cfg._alpha_psnr:.3f}"
-            )
-            vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters)
-            if vbpp is None or vpsnr is None:
-                stopper_flag, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
-                tag = f"(VAL missing; using train) improved: bpp_med={bpp_imp}, psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
-            else:
-                stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
-                tag = f"(val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
-            print(f"[RL] {tag}")
+                if batch_vals:
+                    bpp_b = [v["bpp"] for v in batch_vals]
+                    psnr_b = [v["psnr"] for v in batch_vals]
+                    mss_b = [v["msssim"] for v in batch_vals]
+                    stats_bpp_b = np.percentile(bpp_b, [0, 25, 50, 75, 100])
+                    stats_psnr_b = np.percentile(psnr_b, [0, 25, 50, 75, 100])
+                    avg_msssim_b = float(np.mean(mss_b))
+                    psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_b[2] - env_cfg.psnr_margin_db)
+                    mss_req_b = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
+                    pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(psnr_b)))
+                    pen_mss_b = max(0.0, mss_req_b - avg_msssim_b)
+                    avg_reward_b = -(env_cfg._alpha_bpp * float(np.mean(bpp_b)) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
+                    print(
+                        f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  BATCH  "
+                        f"bpp=[{stats_bpp_b[0]:.3f}, {stats_bpp_b[1]:.3f}, {stats_bpp_b[2]:.3f}, {stats_bpp_b[3]:.3f}, {stats_bpp_b[4]:.3f}]  "
+                        f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
+                        f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
+                    )
+                    env_cfg._bpp_cuts = (float(stats_bpp_b[1]), float(stats_bpp_b[2]), float(stats_bpp_b[3]))
+                    env_cfg._psnr_cuts = (float(stats_psnr_b[1]), float(stats_psnr_b[2]), float(stats_psnr_b[3]))
 
-            ckpt_dir = out_model.parent / "checkpoints"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
-            trainer.save_torchscript(ckpt_path)
-            print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+                batch_elapsed = time.perf_counter() - batch_start
+                print(f"[Epoch {it+1}/{iters}] TRAIN-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
+                pp_train.update(batch_idx)
 
-            if stopper_flag:
-                print(
-                    f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs "
-                    f"(after warmup {early_cfg.start_after})."
-                )
-                trainer.save_torchscript(out_model)
-                print(f"[RL] saved TorchScript policy -> {out_model}")
+                del envs, imgs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 malloc_trim()
-                return
-        else:
-            print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  TRAIN_epoch_elapsed={epoch_elapsed:.2f}s")
-            vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters)
-            if vbpp is None or vpsnr is None:
-                stopper_flag, bpp_imp, db_imp = stopper.update(it, float("inf"), float("-inf"))
-            else:
-                stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
-            print(f"[RL] (val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}")
-            ckpt_dir = out_model.parent / "checkpoints"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
-            trainer.save_torchscript(ckpt_path)
-            print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
-            malloc_trim()
 
-    trainer.save_torchscript(out_model)
-    print(f"[RL] saved TorchScript policy -> {out_model}")
-    malloc_trim()
+            pp_train.done()
+            epoch_elapsed = time.perf_counter() - epoch_start
+
+            if epoch_vals:
+                bpp_vals = [v["bpp"] for v in epoch_vals]
+                psnr_vals = [v["psnr"] for v in epoch_vals]
+                msssim_vals = [v["msssim"] for v in epoch_vals]
+                med_bpp  = float(np.median(bpp_vals))
+                min_bpp  = float(np.min(bpp_vals))
+                max_bpp  = float(np.max(bpp_vals))
+                q1_bpp   = float(np.percentile(bpp_vals, 25))
+                q3_bpp   = float(np.percentile(bpp_vals, 75))
+                med_psnr = float(np.median(psnr_vals))
+                min_psnr = float(np.min(psnr_vals))
+                max_psnr = float(np.max(psnr_vals))
+                q1_psnr  = float(np.percentile(psnr_vals, 25))
+                q3_psnr  = float(np.percentile(psnr_vals, 75))
+                avg_msssim = float(np.mean(msssim_vals))
+                psnr_req_ep = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(med_psnr - env_cfg.psnr_margin_db)
+                mss_req_ep = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
+                pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(psnr_vals)))
+                pen_mss_ep = max(0.0, mss_req_ep - avg_msssim)
+                W_total = -(env_cfg._alpha_bpp * float(np.mean(bpp_vals)) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
+                print(
+                    f"[RL] iter {it+1}/{iters}  "
+                    f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
+                    f"PSNR_med={med_psnr:.2f} dB (min={min_psnr:.2f}, q1={q1_psnr:.2f}, q3={q3_psnr:.2f}, max={max_psnr:.2f})  "
+                    f"MS-SSIM_avg={avg_msssim:.3f}  "
+                    f"Wtotal={W_total:.3f}  "
+                    f"TRAIN_epoch_elapsed={epoch_elapsed:.2f}s  "
+                    f"alpha_bpp={env_cfg._alpha_bpp:.3f} alpha_psnr={env_cfg._alpha_psnr:.3f}"
+                )
+
+                vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters, shared_executor)
+                if vbpp is None or vpsnr is None:
+                    stopper_flag, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
+                    tag = f"(VAL missing; using train) improved: bpp_med={bpp_imp}, psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
+                else:
+                    stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
+                    tag = f"(val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
+                print(f"[RL] {tag}")
+
+                ckpt_dir = out_model.parent / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
+                trainer.save_torchscript(ckpt_path)
+                print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+
+                if stopper_flag:
+                    print(
+                        f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs "
+                        f"(after warmup {early_cfg.start_after})."
+                    )
+                    trainer.save_torchscript(out_model)
+                    print(f"[RL] saved TorchScript policy -> {out_model}")
+                    malloc_trim()
+                    return
+            else:
+                print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  TRAIN_epoch_elapsed={epoch_elapsed:.2f}s")
+                vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters, shared_executor)
+                if vbpp is None or vpsnr is None:
+                    stopper_flag, bpp_imp, db_imp = stopper.update(it, float("inf"), float("-inf"))
+                else:
+                    stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
+                print(f"[RL] (val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}")
+                ckpt_dir = out_model.parent / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
+                trainer.save_torchscript(ckpt_path)
+                print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+                malloc_trim()
+
+        trainer.save_torchscript(out_model)
+        print(f"[RL] saved TorchScript policy -> {out_model}")
+        malloc_trim()
+
+    finally:
+        try:
+            shared_executor.shutdown(wait=True)
+        except Exception:
+            pass
+        malloc_trim()

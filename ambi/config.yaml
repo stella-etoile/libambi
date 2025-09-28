@@ -21,6 +21,7 @@ format: {magic: AMBI, version: 3}
 
 rl:
   control_split: true
+  progress_pct: 1
 
   weights:
     bpp_q1: 0.3
@@ -48,7 +49,7 @@ rl:
   loading:
     mode: lazy
     lazy_by: memory
-    mem_fraction: 0.83
+    mem_fraction: 0.7
     batch_size: 32
     iters_per_batch: 1
     aug_per_image: 3
