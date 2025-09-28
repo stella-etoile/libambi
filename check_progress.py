@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import re, os, sys, math, argparse, pathlib, statistics, csv
 
 RED = "\033[31m"

@@ -1,4 +1,3 @@
-# ambi/compress.py
 from __future__ import annotations
 import os
 import zlib
@@ -12,13 +11,10 @@ __all__ = [
     "COMP_ZLIB",
 ]
 
-# Per-record compression IDs (stored in bitstream)
 COMP_NONE = 0
 COMP_ZLIB = 1
-# Reserve: 2=rangecoder, 3=zstd, 4=brotli, ...
 
 class Compressor:
-    """Interface for per-record compression."""
     comp_id: int = COMP_NONE
     name: str = "none"
 
@@ -26,11 +22,9 @@ class Compressor:
         return f"{self.name}"
 
     def compress(self, raw: bytes) -> Tuple[int, bytes, int]:
-        """Return (comp_id, payload_bytes, raw_len)."""
         return (COMP_NONE, raw, len(raw))
 
     def decompress(self, comp_id: int, payload: bytes, raw_len: Optional[int]) -> bytes:
-        """Return raw bytes (length must equal raw_len when provided)."""
         return payload
 
 class ZlibCompressor(Compressor):
@@ -45,7 +39,6 @@ class ZlibCompressor(Compressor):
 
     def compress(self, raw: bytes) -> Tuple[int, bytes, int]:
         c = zlib.compress(raw, self.level)
-        # Only use if it helps (and avoids degenerate tiny overhead)
         if len(c) + 3 < len(raw):
             return (self.comp_id, c, len(raw))
         else:
@@ -63,12 +56,6 @@ class ZlibCompressor(Compressor):
 
 
 def choose_compressor(cfg: Optional[Dict[str, Any]]) -> Compressor:
-    """
-    Returns a Compressor instance based on YAML or env.
-      encoder.compression.type: zlib|none
-      encoder.compression.level: 1..9 (zlib)
-    Env override: AMBI_ZLIB_LEVEL
-    """
     enc = cfg.get("encoder", {}) if cfg else {}
     comp = enc.get("compression", {}) if isinstance(enc.get("compression", {}), dict) else {}
     ctype = str(comp.get("type", "zlib")).lower()
@@ -79,9 +66,7 @@ def choose_compressor(cfg: Optional[Dict[str, Any]]) -> Compressor:
     if ctype in ("zlib", "deflate", "1", "true"):
         lvl = comp.get("level", None)
         if lvl is None:
-            # env override wins
             lvl = int(os.environ.get("AMBI_ZLIB_LEVEL", "6"))
         return ZlibCompressor(level=int(lvl))
 
-    # Fallback to none for unrecognized types (keeps decoding sane)
     return Compressor()

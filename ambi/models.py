@@ -1,15 +1,9 @@
-# ambi/models.py
 from __future__ import annotations
 import numpy as np
 from typing import Tuple, List, Dict, Any, Optional
 
-# -----------------------------
-# Prior: small deterministic candidate bank
-# -----------------------------
-
 def _blur5(x: np.ndarray) -> np.ndarray:
     x0 = x.astype(np.float32, copy=False)
-    # 4-neighborhood average + self
     x1 = (np.roll(x0, 1, 0) + np.roll(x0, -1, 0) +
           np.roll(x0, 1, 1) + np.roll(x0, -1, 1) + x0) / 5.0
     return x1
@@ -32,7 +26,6 @@ def _edge_boost(x: np.ndarray, a: float = 0.35) -> np.ndarray:
     return np.clip(x + a * e, 0.0, 1.0)
 
 def _cand_bank(x: np.ndarray) -> List[np.ndarray]:
-    # Deterministic bank; first item is identity (top-1 prior)
     return [
         x,
         _blur5(x),
@@ -43,7 +36,6 @@ def _cand_bank(x: np.ndarray) -> List[np.ndarray]:
     ]
 
 class Prior:
-    """Abstract prior interface."""
     def __init__(self, K: int = 1):
         self.K = int(K)
 
@@ -51,10 +43,6 @@ class Prior:
         raise NotImplementedError
 
 class DeterministicPrior(Prior):
-    """
-    Simple prior that returns first-K transforms from a small bank,
-    ordered by negative MSE to the coarse block (best first).
-    """
     def propose(self, coarse_block: np.ndarray, K: Optional[int] = None) -> Tuple[List[np.ndarray], np.ndarray]:
         k = int(K if K is not None else self.K)
         bank = _cand_bank(coarse_block)
@@ -63,7 +51,7 @@ class DeterministicPrior(Prior):
         base = coarse_block.astype(np.float32, copy=False)
         for c in arr:
             d = float(np.mean((c.astype(np.float32, copy=False) - base) ** 2))
-            scores.append(-d)  # higher is better
+            scores.append(-d)
         order = np.argsort(-np.asarray(scores))
         arr2 = [arr[i] for i in order]
         scores2 = np.asarray([scores[i] for i in order], dtype=np.float32)
@@ -73,15 +61,9 @@ def load_prior(cfg: Dict[str, Any] | None) -> Prior:
     pc = cfg.get("prior", {}) if cfg else {}
     t = str(pc.get("type", "deterministic")).lower()
     K = int(pc.get("K", 5))
-    # (Only deterministic provided in stub)
     return DeterministicPrior(K=K)
 
-# -----------------------------
-# Policies
-# -----------------------------
-
 class Policy:
-    """Base policy: returns dict with q, K, H."""
     def __init__(self, q: int = 12, K: int = 5, H: int = 8):
         self.q = int(q); self.K = int(K); self.H = int(H)
 
@@ -89,11 +71,6 @@ class Policy:
         return {"q": self.q, "K": self.K, "H": self.H}
 
 class FixedMarginPolicy(Policy):
-    """
-    H decision based on score margin from the prior:
-      if (scores[0] - scores[1]) >= tau → H = H_lo (usually 0)
-      else → H = H_hi (e.g., 8)
-    """
     def __init__(self, q: int = 12, K: int = 5, H_hi: int = 8, H_lo: int = 0, score_margin_thresh: float = 0.06):
         super().__init__(q=q, K=K, H=H_hi)
         self.H_hi = int(H_hi)
@@ -102,23 +79,11 @@ class FixedMarginPolicy(Policy):
 
     def decide_H(self, scores: np.ndarray) -> int:
         if scores is None or len(scores) < 2:
-            return self.H_lo  # confident by default if only one cand
+            return self.H_lo
         m = float(scores[0] - scores[1])
         return self.H_lo if m >= self.tau else self.H_hi
 
 class BudgetPolicy(FixedMarginPolicy):
-    """
-    Budget-aware heuristic policy.
-
-    Config keys under policy:
-      algorithm: "budget"
-      target_bpp: float           # desired overall bpp (guidance)
-      q_bounds: [min_q, max_q]    # quant step bounds
-      K_bounds: [min_K, max_K]    # candidate count bounds
-      h_low: int                  # H when confident
-      h_high: int                 # H when not confident
-      score_margin_thresh: float  # margin threshold for H
-    """
     def __init__(
         self,
         target_bpp: float = 0.7,
@@ -151,34 +116,20 @@ class BudgetPolicy(FixedMarginPolicy):
     def act(self, features: np.ndarray) -> Dict[str, int]:
         comp = self._safe_complexity(features)
 
-        # Map complexity → q (higher comp ⇒ lower q)
         q_span = max(1, self.q_hi - self.q_lo)
         q = int(round(self.q_hi - comp * q_span))
         q = int(np.clip(q, self.q_lo, self.q_hi))
 
-        # Map complexity → K
         K = int(round(self.K_lo + comp * (self.K_hi - self.K_lo)))
         K = int(np.clip(K, self.K_lo, self.K_hi))
 
-        # H will be decided later via decide_H(scores) if available
         return {"q": q, "K": K, "H": self.H}
 
-# -----------------------------
-# RL Policy (TorchScript)
-# -----------------------------
-
 class RLPolicyTorch(Policy):
-    """
-    TorchScript policy that maps feature vector -> logits over bins for (q, K, H).
-    Expects the same bins as rl.py:
-      Q_BINS = 8..32 step 2
-      K_BINS = [1,2,3,4,5,6]
-      H_BINS = [0,8]
-    """
     def __init__(self, script_path: str, fallback_q: int = 12, fallback_K: int = 5, fallback_H: int = 8, device: str = "cpu"):
         super().__init__(q=fallback_q, K=fallback_K, H=fallback_H)
         try:
-            import torch  # defer import so non-RL users don't need torch
+            import torch
         except Exception as e:
             raise RuntimeError("RLPolicyTorch requires PyTorch. Install torch or switch policy.algorithm.") from e
         self.torch = torch
@@ -200,10 +151,6 @@ class RLPolicyTorch(Policy):
         H = int(self.Hs[np.clip(hi, 0, len(self.Hs) - 1)])
         return {"q": q, "K": K, "H": H}
 
-# -----------------------------
-# Loaders
-# -----------------------------
-
 def load_policy(cfg: Dict[str, Any] | None):
     ec = cfg.get("encoder", {}) if cfg else {}
     pc = cfg.get("policy", {}) if cfg else {}
@@ -218,7 +165,7 @@ def load_policy(cfg: Dict[str, Any] | None):
             q=q,
             K=K,
             H_hi=H,
-            H_lo=int(pc.get("h_low", 0)),  # allow override if present
+            H_lo=int(pc.get("h_low", 0)),
             score_margin_thresh=float(pc.get("score_margin_thresh", 0.06)),
         )
 
@@ -241,5 +188,4 @@ def load_policy(cfg: Dict[str, Any] | None):
         device = pc.get("device", "cpu")
         return RLPolicyTorch(script_path=str(script), fallback_q=q, fallback_K=K, fallback_H=H, device=device)
 
-    # Fallback: fixed params
     return Policy(q=q, K=K, H=H)

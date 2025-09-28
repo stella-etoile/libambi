@@ -16,7 +16,7 @@ __pycache__/
 
 *.ts
 
-check_progress.py
+# check_progress.py
 medstdcalc.py
 plot_ambi_logs.py
 check_size.py

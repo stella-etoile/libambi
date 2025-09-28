@@ -68,7 +68,6 @@ class ProgressPrinter:
             self.next += self.step
 
     def done(self, done: Optional[int] = None, reason: Optional[str] = None):
-        """Finalize progress. If 'done' is provided (< total), print true % instead of 100%."""
         if not self.enabled:
             return
         elapsed = time.perf_counter() - self.start
@@ -751,7 +750,7 @@ class ImageBatcher:
         shuffle_seed: int = 0,
         cached_imgs: Optional[List[np.ndarray]] = None,
         executor: Optional[ThreadPoolExecutor] = None,
-        progress_pct: float = 0.0,   # NEW
+        progress_pct: float = 0.0,
     ):
         self.paths = list(paths)
         self.mode = mode
@@ -765,7 +764,7 @@ class ImageBatcher:
         self._cache: Optional[List[np.ndarray]] = None
         self.io_workers = int(os.environ.get("AMBI_IO_WORKERS", "8"))
         self._ext_executor = executor
-        self.progress_pct = float(progress_pct)  # NEW
+        self.progress_pct = float(progress_pct)
 
         if cached_imgs is not None:
             self._cache = list(cached_imgs)
@@ -834,7 +833,6 @@ class ImageBatcher:
                 rng.shuffle(imgs)
             return imgs
 
-        # memory-based lazy loading
         avail0 = psutil.virtual_memory().available
         budget = max(128*1024*1024, int(avail0 * self.mem_fraction))
         imgs: List[np.ndarray] = []
@@ -869,7 +867,7 @@ class ImageBatcher:
             used += need
             self._i += 1
             loaded += 1
-            pp.update(loaded)  # per path this call consumed
+            pp.update(loaded)
 
         if not imgs:
             pp.done(loaded, reason="no images fit")
@@ -889,7 +887,7 @@ def preload_all_images(
     seed: int,
     io_workers: int = 8,
     executor: Optional[ThreadPoolExecutor] = None,
-    progress_pct: float = 0.0,   # NEW
+    progress_pct: float = 0.0,
 ) -> List[np.ndarray]:
     rng = np.random.default_rng(seed)
     imgs: List[np.ndarray] = []
@@ -1229,7 +1227,7 @@ def train_rl(
                     shuffle_seed=loading_cfg.shuffle_seed + it,
                     cached_imgs=cached_imgs,
                     executor=shared_executor,
-                    progress_pct=progress_pct,  # harmless (no loading)
+                    progress_pct=progress_pct,
                 )
                 num_batches = math.ceil(len(cached_imgs) / loading_cfg.batch_size)
             else:
@@ -1243,7 +1241,7 @@ def train_rl(
                     aug_kinds=loading_cfg.aug_kinds,
                     shuffle_seed=loading_cfg.shuffle_seed + it,
                     executor=shared_executor,
-                    progress_pct=progress_pct,  # NEW
+                    progress_pct=progress_pct,
                 )
                 if batcher.mode == "count":
                     num_batches = math.ceil(len(paths) / batcher.batch_size)

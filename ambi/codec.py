@@ -1,4 +1,3 @@
-# ambi/codec.py
 from __future__ import annotations
 
 import os
@@ -34,10 +33,6 @@ from ambi.compress import (
     COMP_NONE, COMP_ZLIB,
 )
 
-# -----------------------
-# helpers
-# -----------------------
-
 def _mse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean((np.clip(a, 0, 1) - np.clip(b, 0, 1)) ** 2))
 
@@ -65,10 +60,6 @@ def _get_executor():
         pass
     return ProcessPoolExecutor
 
-# -----------------------
-# ENCODE workers
-# -----------------------
-
 _ENC_SHM = None
 _ENC_ARR = None
 _ENC_POLICY = None
@@ -77,7 +68,7 @@ _ENC_Q_DEFAULT = 12
 _ENC_K_DEFAULT = 5
 _ENC_H_DEFAULT = 8
 _ENC_HAVE_COMP = False
-_ENC_COMP = Compressor()  # polymorphic
+_ENC_COMP = Compressor()
 
 def _enc_worker_init(shm_name: str, shape: tuple, dtype_str: str, cfg: dict):
     global _ENC_SHM, _ENC_ARR, _ENC_POLICY, _ENC_PRIOR
@@ -100,13 +91,6 @@ def _enc_worker_init(shm_name: str, shape: tuple, dtype_str: str, cfg: dict):
         print(f"[AMBI] worker start pid={os.getpid()} role=encode comp={_ENC_COMP.banner()} v3={_ENC_HAVE_COMP}")
 
 def _encode_batch(batch):
-    """
-    batch = list[(i_leaf, (x, y, bw, bh)), ...]  ->  [(i_leaf, bytes)]
-    Record layout (v3+):
-      x,y,w,h,q,K,H,hp,refine_flag[,refine_idx], comp, [len_c, len_r, CBY] or [len_r, RBY]
-    Legacy v1/v2 (no comp):
-      x,y,w,h,q,K,H,hp,refine_flag[,refine_idx], len_r, RBY
-    """
     ycc = _ENC_ARR
     out = []
     for i_leaf, (x, y, bwid, bhei) in batch:
@@ -155,7 +139,6 @@ def _encode_batch(batch):
             bwb.write_varint(refine_idx)
 
         if _ENC_HAVE_COMP:
-            # v3+: write comp tag
             bwb.write_varint(comp_id)
             if comp_id == COMP_NONE:
                 bwb.write_varint(raw_len)
@@ -165,27 +148,21 @@ def _encode_batch(batch):
                 bwb.write_varint(raw_len)
                 bwb.write_bytes(payload)
             else:
-                # unknown comp -> store raw defensively
                 bwb.write_varint(raw_len)
                 bwb.write_bytes(by_raw)
         else:
-            # legacy v1/v2 record: raw only
             bwb.write_varint(raw_len)
             bwb.write_bytes(by_raw)
 
         out.append((i_leaf, bwb.getvalue()))
     return out
 
-# -----------------------
-# DECODE workers
-# -----------------------
-
 _DEC_SHM = None
 _DEC_REC = None
 _DEC_IN_SHM = None
 _DEC_IN_BUF = None
 _DEC_HAVE_COMP = False
-_DEC_COMP = Compressor()  # polymorphic
+_DEC_COMP = Compressor()
 
 def _dec_worker_init(rec_shm_name: str, rec_shape: tuple, rec_dtype_str: str,
                      in_shm_name: str, in_size: int,
@@ -202,11 +179,6 @@ def _dec_worker_init(rec_shm_name: str, rec_shape: tuple, rec_dtype_str: str,
         print(f"[AMBI] worker start pid={os.getpid()} role=decode comp={_DEC_COMP.banner()} v3={_DEC_HAVE_COMP}")
 
 def _decode_records_bytes(records_bytes: bytes):
-    """
-    Parse a sequence of block records from a contiguous byte slice and write them
-    into the shared output image.
-    v3+: comp tag is present. v1/v2: raw length only.
-    """
     buf = memoryview(records_bytes)
     n = len(buf); off = 0
 
@@ -238,7 +210,6 @@ def _decode_records_bytes(records_bytes: bytes):
         else:
             refine_idx = 0
 
-        # payload (with/without comp tag)
         if _DEC_HAVE_COMP:
             comp_id, off = read_uvarint(off)
             if comp_id == COMP_NONE:
@@ -285,10 +256,6 @@ def _decode_batch_from_index(args):
     _decode_records_bytes(buf)
     return 1
 
-# -----------------------
-# public API
-# -----------------------
-
 def encode_image(inp: Path, outp: Path, cfg: dict):
     img = load_image_rgb(inp)
     ycc = rgb_to_ycbcr(img)
@@ -296,7 +263,6 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
     enc = cfg.get("encoder", {}) if cfg else {}
     fmt = cfg.get("format", {}) if cfg else {}
 
-    # tiling/quadtree
     block_default = int(enc.get("block_size", 32))
     min_block = int(enc.get("min_block", block_default))
     max_block = int(enc.get("max_block", block_default))
@@ -313,7 +279,6 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
         num_workers = _env_int("AMBI_NUM_WORKERS", default=max(1, min(ncpu - 1, 16)))
     num_workers = max(1, min(int(num_workers), 64))
 
-    # leaves
     if use_quadtree:
         split_cfg = enc.get("split", {}) if isinstance(enc.get("split", {}), dict) else {}
         var_th = float(split_cfg.get("var_thresh", os.environ.get("AMBI_SPLIT_VAR", 0.0025)))
@@ -340,7 +305,6 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
     nbatches = int(math.ceil(n_blocks / float(chunk_size)))
     mode = "qt" if use_quadtree else "fixed"
 
-    # compressor (for banner only; workers init their own)
     have_comp = (version >= 3)
     comp = choose_compressor(cfg)
     comp_desc = comp.banner() if have_comp else "none(v<3)"
@@ -348,14 +312,12 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
     print(f"[AMBI] encode workers={num_workers} chunk={chunk_size} blocks={n_blocks} "
           f"batches={nbatches} mode={mode} sizes{{{hsum}}} ver={version} comp={comp_desc}")
 
-    # header
     header = BitWriter()
     h, w, _ = ycc.shape
     write_header(header, magic, version, w, h, min_block if use_quadtree else block_default)
     header.write_varint(n_blocks)
     header_bytes = header.getvalue()
 
-    # share ycc to workers
     shm = shared_memory.SharedMemory(create=True, size=ycc.nbytes)
     try:
         np.ndarray(ycc.shape, dtype=ycc.dtype, buffer=shm.buf)[...] = ycc
@@ -364,7 +326,6 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
         if num_workers == 1:
             for start in range(0, n_blocks, chunk_size):
                 batch = leaves[start:start+chunk_size]
-                # run locally with a local copy of cfg (worker uses cfg for comp/version)
                 global _ENC_HAVE_COMP, _ENC_COMP
                 _ENC_HAVE_COMP = (version >= 3)
                 _ENC_COMP = comp
@@ -382,7 +343,6 @@ def encode_image(inp: Path, outp: Path, cfg: dict):
                     for i_leaf, blob in f.result():
                         parts[i_leaf] = blob
 
-        # payload + index
         payload_chunks = []
         offsets = []
         pos = len(header_bytes)
@@ -437,7 +397,7 @@ def decode_image(inp: Path, outp: Path, num_workers: int | None = None, chunk_si
         chunk_size = min(int(chunk_size), max_chunk)
 
     have_comp = (version >= 3)
-    comp = choose_compressor({"encoder": {"compression": {"type": "zlib"}}})  # default selection for display
+    comp = choose_compressor({"encoder": {"compression": {"type": "zlib"}}})
     print(f"[AMBI] decode workers={num_workers} chunk={chunk_size} blocks={n} ver={version} comp={'enabled' if have_comp else 'none(v<3)'}")
 
     rec = np.zeros((h, w, 3), dtype=np.float32)
@@ -452,7 +412,6 @@ def decode_image(inp: Path, outp: Path, num_workers: int | None = None, chunk_si
         Pool = _get_executor()
 
         if idx and idx.get("ranges"):
-            # CRC validate if available (v2)
             if idx.get("version") == 2 and idx.get("payload_crc32") is not None:
                 ranges = idx["ranges"]
                 table_start = int(idx["table_start"])
@@ -473,7 +432,6 @@ def decode_image(inp: Path, outp: Path, num_workers: int | None = None, chunk_si
                               unit="chunk"):
                     pass
         else:
-            # No footer: compatibility local path
             print("[AMBI] no index footer found; using compatibility path (slower)")
             nbatches = int(math.ceil(n / float(chunk_size)))
             pbar_read = tqdm(total=n,
@@ -494,11 +452,9 @@ def decode_image(inp: Path, outp: Path, num_workers: int | None = None, chunk_si
                     hp = br.read_varint()
                     refine_flag = br.read_varint()
                     refine_idx = br.read_varint() if refine_flag else None
-                    # legacy compat path assumes v<3 (raw only)
                     ln = br.read_varint()
                     by = br.read_bytes(ln)
 
-                    # re-emit as v<3 raw record
                     chunk_writer.write_varint(x); chunk_writer.write_varint(y)
                     chunk_writer.write_varint(bwid); chunk_writer.write_varint(bhei)
                     chunk_writer.write_varint(q); chunk_writer.write_varint(K); chunk_writer.write_varint(H)

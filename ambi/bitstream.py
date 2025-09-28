@@ -1,31 +1,3 @@
-# ambi/bitstream.py
-"""
-Bitstream index footer helpers for AMBI.
-
-Footer v1 layout (legacy):
-  [table bytes][uint64 table_size][b'IDX!']
-
-Footer v2 layout (with CRC32 over payload):
-  [table bytes][uint32 payload_crc32][uint64 table_size][b'IDX2']
-
-Where:
-- table bytes = b'AMBI' + varint(n_chunks) + repeat(varint(offset), varint(count))
-- Offsets are absolute file offsets where each chunk's **first block record** begins.
-- The last chunk's end is the start of the table (aka table_start).
-- payload_crc32 is computed over the contiguous payload region:
-    data[min_offset : table_start]
-
-Exports:
-- write_index_footer_v1(bw, chunk_offsets_counts)
-- write_index_footer_v2(bw, chunk_offsets_counts, payload_crc)
-- read_index_footer(data) -> dict | None
-    {
-      "version": 1|2,
-      "ranges": [(start, end, count), ...],
-      "table_start": int,
-      "payload_crc32": int | None,
-    }
-"""
 from __future__ import annotations
 import struct
 from typing import List, Tuple, Optional, Dict
@@ -80,7 +52,6 @@ def read_index_footer(data: bytes) -> Optional[Dict]:
 
     magic = data[-4:]
     if magic == FOOTER_MAGIC_V2:
-        # ... [table][crc32][size][magic]
         if len(data) < 4 + 8 + 4:
             return None
         table_size = struct.unpack("<Q", data[-12:-4])[0]
@@ -93,7 +64,6 @@ def read_index_footer(data: bytes) -> Optional[Dict]:
             pairs = _parse_table(table)
         except Exception:
             return None
-        # build ranges using next offset or table_start
         ranges = []
         for i, (off, cnt) in enumerate(pairs):
             next_off = pairs[i+1][0] if i + 1 < len(pairs) else table_start
@@ -106,7 +76,6 @@ def read_index_footer(data: bytes) -> Optional[Dict]:
         }
 
     if magic == FOOTER_MAGIC_V1:
-        # ... [table][size][magic]
         table_size = struct.unpack("<Q", data[-12:-4])[0]
         table_start = len(data) - 12 - table_size
         if table_start < 0:
@@ -127,5 +96,4 @@ def read_index_footer(data: bytes) -> Optional[Dict]:
             "payload_crc32": None,
         }
 
-    # Not an indexed stream
     return None
