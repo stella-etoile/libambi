@@ -1,7 +1,7 @@
 device: cpu
 
 encoder:
-  compression: {type: zlib, level: 9}
+  compression: {type: zlib, level: 3}
   min_block: 32
   max_block: 128
   block_size: 16

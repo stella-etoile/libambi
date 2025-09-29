@@ -1,9 +1,13 @@
 from __future__ import annotations
 import math, gc, os, time
-os.environ.setdefault("OMP_NUM_THREADS","1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
-os.environ.setdefault("MKL_NUM_THREADS","1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
+# os.environ.setdefault("OMP_NUM_THREADS","1")
+# os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
+# os.environ.setdefault("MKL_NUM_THREADS","1")
+# os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -22,6 +26,7 @@ from ambi.partition import dynamic_quadtree_leaves
 from ambi.compress import choose_compressor, COMP_NONE, COMP_ZLIB
 from ambi.distortion import ssim, ms_ssim
 import ctypes
+import random
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -48,6 +53,91 @@ if os.environ.get("AMBI_NOPROGRESS", "") == "1":
         return _NoTqdm()
 else:
     from tqdm.auto import tqdm
+
+@dataclass
+class _Reservoir:
+    cap: int = 4096
+    bpp: list = None
+    psnr: list = None
+    mss: list = None
+    seen: int = 0
+    def __post_init__(self):
+        self.bpp = [] if self.bpp is None else self.bpp
+        self.psnr = [] if self.psnr is None else self.psnr
+        self.mss = [] if self.mss is None else self.mss
+    def add(self, b, p, m):
+        self.seen += 1
+        if len(self.bpp) < self.cap:
+            self.bpp.append(b); self.psnr.append(p); self.mss.append(m)
+        else:
+            j = random.randint(0, self.seen - 1)
+            if j < self.cap:
+                self.bpp[j] = b; self.psnr[j] = p; self.mss[j] = m
+
+@dataclass
+class _Reservoir:
+    cap: int = 4096
+    bpp: list = None
+    psnr: list = None
+    mss: list = None
+    seen: int = 0
+    def __post_init__(self):
+        self.bpp = [] if self.bpp is None else self.bpp
+        self.psnr = [] if self.psnr is None else self.psnr
+        self.mss = [] if self.mss is None else self.mss
+    def add(self, b, p, m):
+        self.seen += 1
+        if len(self.bpp) < self.cap:
+            self.bpp.append(b); self.psnr.append(p); self.mss.append(m)
+        else:
+            j = random.randint(0, self.seen - 1)
+            if j < self.cap:
+                self.bpp[j] = b; self.psnr[j] = p; self.mss[j] = m
+
+@dataclass
+class _StatPack:
+    n: int = 0
+    bpp_sum: float = 0.0
+    psnr_sum: float = 0.0
+    mss_sum: float = 0.0
+    bpp_min: float = float("inf")
+    bpp_max: float = float("-inf")
+    psnr_min: float = float("inf")
+    psnr_max: float = float("-inf")
+    res: _Reservoir = None
+    def __post_init__(self):
+        if self.res is None:
+            self.res = _Reservoir()
+    def add(self, b, p, m):
+        self.n += 1
+        self.bpp_sum += b
+        self.psnr_sum += p
+        self.mss_sum += m
+        if b < self.bpp_min: self.bpp_min = b
+        if b > self.bpp_max: self.bpp_max = b
+        if p < self.psnr_min: self.psnr_min = p
+        if p > self.psnr_max: self.psnr_max = p
+        self.res.add(b, p, m)
+    def merge(self, other):
+        self.n += other.n
+        self.bpp_sum += other.bpp_sum
+        self.psnr_sum += other.psnr_sum
+        self.mss_sum += other.mss_sum
+        if other.bpp_min < self.bpp_min: self.bpp_min = other.bpp_min
+        if other.bpp_max > self.bpp_max: self.bpp_max = other.bpp_max
+        if other.psnr_min < self.psnr_min: self.psnr_min = other.psnr_min
+        if other.psnr_max > self.psnr_max: self.psnr_max = other.psnr_max
+        for i in range(len(other.res.bpp)):
+            self.res.add(other.res.bpp[i], other.res.psnr[i], other.res.mss[i])
+    def means(self):
+        if self.n == 0: return 0.0, 0.0, 0.0
+        return self.bpp_sum / self.n, self.psnr_sum / self.n, self.mss_sum / self.n
+    def percentiles(self):
+        if not self.res.bpp:
+            return [0,0,0,0,0],[0,0,0,0,0]
+        bpp_q = np.percentile(np.asarray(self.res.bpp, dtype=np.float64), [0,25,50,75,100])
+        psn_q = np.percentile(np.asarray(self.res.psnr, dtype=np.float64), [0,25,50,75,100])
+        return bpp_q, psn_q
 
 class ProgressPrinter:
     def __init__(self, total: int, pct_step: float, label: str):
@@ -486,13 +576,13 @@ class PPOTrainer:
         except Exception:
             pass
 
-    def _gather(self, envs: List[AMBIEnv], steps: int):
-        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
-        info_buf: List[Dict[str, Any]] = []
+    def _gather(self, envs: List[AMBIEnv], steps: int, collect_stats: bool = True):
+        obs_buf, act_buf, logp_buf, val_buf, rew_buf, done_buf = [], [], [], [], [], []
         n_envs = len(envs)
         states = [env.reset() for env in envs]
         states_t = torch.as_tensor(np.stack(states), dtype=torch.float32, device=self.cfg.device)
         pp = ProgressPrinter(steps, self.progress_pct, "rollout")
+        stat = _StatPack() if collect_stats else None
         with tqdm(total=steps, desc="RL rollout", unit="step", leave=False) as pbar:
             for t in range(steps):
                 if self.control_split:
@@ -502,9 +592,7 @@ class PPOTrainer:
                     pik = torch.distributions.Categorical(logits=lk)
                     pih = torch.distributions.Categorical(logits=lh)
                     a_split = pi_split.sample()
-                    aq = piq.sample()
-                    ak = pik.sample()
-                    ah = pih.sample()
+                    aq = piq.sample(); ak = pik.sample(); ah = pih.sample()
                     keep_mask = (1.0 - a_split).detach()
                     logp = (pi_split.log_prob(a_split)
                             + (piq.log_prob(aq) + pik.log_prob(ak) + pih.log_prob(ah)) * keep_mask)
@@ -521,7 +609,9 @@ class PPOTrainer:
                         ns, r, d, info = envs[i].step((int(split_np[i]), int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
                         if d:
                             ns = envs[i].reset()
-                        next_states[i] = ns; rewards[i] = r; dones[i] = d; info_buf.append(info)
+                        next_states[i] = ns; rewards[i] = r; dones[i] = d
+                        if collect_stats and ("bpp" in info and "psnr" in info and "msssim" in info):
+                            stat.add(float(info["bpp"]), float(info["psnr"]), float(info["msssim"]))
                     obs_buf.append(np.stack(states))
                     act_buf.append(np.stack([split_np, q_idx, k_idx, h_idx], axis=1))
                     logp_buf.append(logp_np)
@@ -529,9 +619,7 @@ class PPOTrainer:
                     rew_buf.append(rewards)
                     done_buf.append(dones)
                     try:
-                        pbar.set_postfix_str(
-                            f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}, split~{float(np.mean(split_np)):.2f}"
-                        )
+                        pbar.set_postfix_str(f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}, split~{float(np.mean(split_np)):.2f}")
                     except Exception:
                         pass
                 else:
@@ -553,7 +641,9 @@ class PPOTrainer:
                         ns, r, d, info = envs[i].step((int(q_idx[i]), int(k_idx[i]), int(h_idx[i])))
                         if d:
                             ns = envs[i].reset()
-                        next_states[i] = ns; rewards[i] = r; dones[i] = d; info_buf.append(info)
+                        next_states[i] = ns; rewards[i] = r; dones[i] = d
+                        if collect_stats and ("bpp" in info and "psnr" in info and "msssim" in info):
+                            stat.add(float(info["bpp"]), float(info["psnr"]), float(info["msssim"]))
                     obs_buf.append(np.stack(states))
                     act_buf.append(np.stack([q_idx, k_idx, h_idx], axis=1))
                     logp_buf.append(logp_np)
@@ -561,9 +651,7 @@ class PPOTrainer:
                     rew_buf.append(rewards)
                     done_buf.append(dones)
                     try:
-                        pbar.set_postfix_str(
-                            f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}"
-                        )
+                        pbar.set_postfix_str(f"K~{float(np.mean(k_idx)):.2f}, H~{float(np.mean(h_idx)):.2f}")
                     except Exception:
                         pass
                 states = next_states
@@ -590,7 +678,7 @@ class PPOTrainer:
         adv = torch.as_tensor(adv, dtype=torch.float32, device=self.cfg.device)
         ret = torch.as_tensor(ret, dtype=torch.float32, device=self.cfg.device)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        return obs, act, logp_old, adv, ret, info_buf
+        return obs, act, logp_old, adv, ret, stat
 
     def update(self, obs, act, logp_old, adv, ret):
         cfg = self.cfg
@@ -974,7 +1062,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         print("[VAL] no images found, skipping")
         return None, None
     trainer.net.eval()
-    epoch_vals: List[Dict[str, float]] = []
+    stat_epoch = _StatPack()
     mem_mode2 = "memory" if loading_cfg.mode.lower() == "lazy" and loading_cfg.lazy_by.lower().startswith("mem") else "count"
     batcher = ImageBatcher(
         paths_val,
@@ -985,7 +1073,7 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         aug_kinds=loading_cfg.aug_kinds,
         shuffle_seed=loading_cfg.shuffle_seed + it,
         executor=shared_executor,
-        progress_pct=getattr(trainer, "progress_pct", 0.0),  # NEW
+        progress_pct=getattr(trainer, "progress_pct", 0.0),
     )
     if batcher.mode == "count":
         num_batches = math.ceil(len(paths_val) / batcher.batch_size)
@@ -1021,57 +1109,42 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         approx_tag = "" if batcher.mode == "count" else "~"
         print(f"[Epoch {it+1}/{iters}] VAL {batch_idx}/{approx_tag}{num_batches}")
         envs = build_envs(imgs, env_cfg, n_envs, env_workers=loading_cfg.io_workers)
-        obs, act, logp_old, adv, ret, info = trainer._gather(envs, ppo_cfg.steps_per_iter)
-        vals = [i for i in info if "bpp" in i and "mse" in i]
-        if vals:
-            epoch_vals.extend(vals)
-            bpp_b = [v["bpp"] for v in vals]
-            psnr_b = [v["psnr"] for v in vals]
-            mss_b = [v["msssim"] for v in vals]
-            stats_bpp_b = np.percentile(bpp_b, [0, 25, 50, 75, 100])
-            stats_psnr_b = np.percentile(psnr_b, [0, 25, 50, 75, 100])
-            avg_msssim_b = float(np.mean(mss_b))
-            psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_b[2] - env_cfg.psnr_margin_db)
+        obs, act, logp_old, adv, ret, stat_batch = trainer._gather(envs, ppo_cfg.steps_per_iter, collect_stats=True)
+        if stat_batch and stat_batch.n > 0:
+            stat_epoch.merge(stat_batch)
+            bpp_q, psn_q = stat_batch.percentiles()
+            avg_msssim_b = float(stat_batch.mss_sum / stat_batch.n)
+            psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(psn_q[2] - env_cfg.psnr_margin_db)
             mss_req_b = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-            pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(psnr_b)))
+            pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(stat_batch.res.psnr)) if stat_batch.res.psnr else 0.0)
             pen_mss_b = max(0.0, mss_req_b - avg_msssim_b)
-            avg_reward_b = -(env_cfg._alpha_bpp * float(np.mean(bpp_b)) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
+            avg_reward_b = -(env_cfg._alpha_bpp * float(stat_batch.bpp_sum / stat_batch.n) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
             print(
                 f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  VAL-BATCH  "
-                f"bpp=[{stats_bpp_b[0]:.3f}, {stats_bpp_b[1]:.3f}, {stats_bpp_b[2]:.3f}, {stats_bpp_b[3]:.3f}, {stats_bpp_b[4]:.3f}]  "
-                f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
+                f"bpp=[{bpp_q[0]:.3f}, {bpp_q[1]:.3f}, {bpp_q[2]:.3f}, {bpp_q[3]:.3f}, {bpp_q[4]:.3f}]  "
+                f"PSNR=[{psn_q[0]:.2f}, {psn_q[1]:.2f}, {psn_q[2]:.2f}, {psn_q[3]:.2f}, {psn_q[4]:.2f}]  "
                 f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
             )
         batch_elapsed = time.perf_counter() - batch_start
         print(f"[Epoch {it+1}/{iters}] VAL-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
         pp_val.update(batch_idx)
-        del envs, imgs, obs, act, logp_old, adv, ret, info
+        del envs, imgs, obs, act, logp_old, adv, ret, stat_batch
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         malloc_trim()
     pp_val.done()
     total_val_elapsed = time.perf_counter() - val_epoch_start
-    if epoch_vals:
-        bpp_vals = [v["bpp"] for v in epoch_vals]
-        psnr_vals = [v["psnr"] for v in epoch_vals]
-        msssim_vals = [v["msssim"] for v in epoch_vals]
-        med_bpp  = float(np.median(bpp_vals))
-        min_bpp  = float(np.min(bpp_vals))
-        max_bpp  = float(np.max(bpp_vals))
-        q1_bpp   = float(np.percentile(bpp_vals, 25))
-        q3_bpp   = float(np.percentile(bpp_vals, 75))
-        med_psnr = float(np.median(psnr_vals))
-        min_psnr = float(np.min(psnr_vals))
-        max_psnr = float(np.max(psnr_vals))
-        q1_psnr  = float(np.percentile(psnr_vals, 25))
-        q3_psnr  = float(np.percentile(psnr_vals, 75))
-        avg_msssim = float(np.mean(msssim_vals))
+    if stat_epoch.n > 0:
+        bpp_q, psn_q = stat_epoch.percentiles()
+        med_bpp = float(bpp_q[2]); min_bpp = float(bpp_q[0]); max_bpp = float(bpp_q[4]); q1_bpp = float(bpp_q[1]); q3_bpp = float(bpp_q[3])
+        med_psnr = float(psn_q[2]); min_psnr = float(psn_q[0]); max_psnr = float(psn_q[4]); q1_psnr = float(psn_q[1]); q3_psnr = float(psn_q[3])
+        avg_msssim = float(stat_epoch.mss_sum / stat_epoch.n)
         psnr_req_ep = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(med_psnr - env_cfg.psnr_margin_db)
         mss_req_ep = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-        pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(psnr_vals)))
+        pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(stat_epoch.res.psnr)) if stat_epoch.res.psnr else 0.0)
         pen_mss_ep = max(0.0, mss_req_ep - avg_msssim)
-        W_total = -(env_cfg._alpha_bpp * float(np.mean(bpp_vals)) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
+        W_total = -(env_cfg._alpha_bpp * float(stat_epoch.bpp_sum / stat_epoch.n) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
         print(
             f"[VAL] iter {it+1}/{iters}  "
             f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
@@ -1214,7 +1287,7 @@ def train_rl(
 
         for it in range(iters):
             epoch_start = time.perf_counter()
-            epoch_vals: List[Dict[str, float]] = []
+            stat_epoch = _StatPack()
 
             if use_eager and keep_cache and cached_imgs is not None:
                 batcher = ImageBatcher(
@@ -1278,42 +1351,38 @@ def train_rl(
                 print(f"[Epoch {it+1}/{iters}] Batch {batch_idx}/{approx_tag}{num_batches}")
 
                 envs = build_envs(imgs, env_cfg, n_envs, env_workers=loading_cfg.io_workers)
-                batch_vals: List[Dict[str, float]] = []
+                stat_batch = _StatPack()
                 inner = max(1, loading_cfg.iters_per_batch)
 
                 for _ in range(inner):
-                    obs, act, logp_old, adv, ret, info = trainer._gather(envs, ppo_cfg.steps_per_iter)
-                    vals = [i for i in info if "bpp" in i and "mse" in i]
-                    if vals:
-                        batch_vals.extend(vals)
-                        epoch_vals.extend(vals)
+                    obs, act, logp_old, adv, ret, stat_roll = trainer._gather(envs, ppo_cfg.steps_per_iter, collect_stats=True)
+                    if stat_roll and stat_roll.n > 0:
+                        stat_batch.merge(stat_roll)
+                        stat_epoch.merge(stat_roll)
                     trainer.update(obs, act, logp_old, adv, ret)
-                    del obs, act, logp_old, adv, ret, info
+                    del obs, act, logp_old, adv, ret, stat_roll
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     malloc_trim()
 
-                if batch_vals:
-                    bpp_b = [v["bpp"] for v in batch_vals]
-                    psnr_b = [v["psnr"] for v in batch_vals]
-                    mss_b = [v["msssim"] for v in batch_vals]
-                    stats_bpp_b = np.percentile(bpp_b, [0, 25, 50, 75, 100])
-                    stats_psnr_b = np.percentile(psnr_b, [0, 25, 50, 75, 100])
-                    avg_msssim_b = float(np.mean(mss_b))
-                    psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(stats_psnr_b[2] - env_cfg.psnr_margin_db)
+                if stat_batch.n > 0:
+                    bpp_q, psn_q = stat_batch.percentiles()
+                    avg_msssim_b = float(stat_batch.mss_sum / stat_batch.n)
+                    psnr_req_b = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(psn_q[2] - env_cfg.psnr_margin_db)
                     mss_req_b = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-                    pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(psnr_b)))
+                    pen_psnr_b = max(0.0, psnr_req_b - float(np.mean(stat_batch.res.psnr)) if stat_batch.res.psnr else 0.0)
                     pen_mss_b = max(0.0, mss_req_b - avg_msssim_b)
-                    avg_reward_b = -(env_cfg._alpha_bpp * float(np.mean(bpp_b)) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
+                    avg_reward_b = -(env_cfg._alpha_bpp * float(stat_batch.bpp_sum / stat_batch.n) + env_cfg._alpha_psnr * pen_psnr_b + env_cfg._alpha_msssim * pen_mss_b)
                     print(
                         f"[Epoch {it+1}/{iters}] {batch_idx}/{approx_tag}{num_batches}  BATCH  "
-                        f"bpp=[{stats_bpp_b[0]:.3f}, {stats_bpp_b[1]:.3f}, {stats_bpp_b[2]:.3f}, {stats_bpp_b[3]:.3f}, {stats_bpp_b[4]:.3f}]  "
-                        f"PSNR=[{stats_psnr_b[0]:.2f}, {stats_psnr_b[1]:.2f}, {stats_psnr_b[2]:.2f}, {stats_psnr_b[3]:.2f}, {stats_psnr_b[4]:.2f}]  "
+                        f"bpp=[{bpp_q[0]:.3f}, {bpp_q[1]:.3f}, {bpp_q[2]:.3f}, {bpp_q[3]:.3f}, {bpp_q[4]:.3f}]  "
+                        f"PSNR=[{psn_q[0]:.2f}, {psn_q[1]:.2f}, {psn_q[2]:.2f}, {psn_q[3]:.2f}, {psn_q[4]:.2f}]  "
                         f"MS={avg_msssim_b:.3f}  R~={avg_reward_b:.3f}"
                     )
-                    env_cfg._bpp_cuts = (float(stats_bpp_b[1]), float(stats_bpp_b[2]), float(stats_bpp_b[3]))
-                    env_cfg._psnr_cuts = (float(stats_psnr_b[1]), float(stats_psnr_b[2]), float(stats_psnr_b[3]))
+                    env_cfg._bpp_cuts = (float(bpp_q[1]), float(bpp_q[2]), float(bpp_q[3]))
+                    env_cfg._psnr_cuts = (float(psn_q[1]), float(psn_q[2]), float(psn_q[3]))
+
 
                 batch_elapsed = time.perf_counter() - batch_start
                 print(f"[Epoch {it+1}/{iters}] TRAIN-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
@@ -1328,26 +1397,16 @@ def train_rl(
             pp_train.done()
             epoch_elapsed = time.perf_counter() - epoch_start
 
-            if epoch_vals:
-                bpp_vals = [v["bpp"] for v in epoch_vals]
-                psnr_vals = [v["psnr"] for v in epoch_vals]
-                msssim_vals = [v["msssim"] for v in epoch_vals]
-                med_bpp  = float(np.median(bpp_vals))
-                min_bpp  = float(np.min(bpp_vals))
-                max_bpp  = float(np.max(bpp_vals))
-                q1_bpp   = float(np.percentile(bpp_vals, 25))
-                q3_bpp   = float(np.percentile(bpp_vals, 75))
-                med_psnr = float(np.median(psnr_vals))
-                min_psnr = float(np.min(psnr_vals))
-                max_psnr = float(np.max(psnr_vals))
-                q1_psnr  = float(np.percentile(psnr_vals, 25))
-                q3_psnr  = float(np.percentile(psnr_vals, 75))
-                avg_msssim = float(np.mean(msssim_vals))
+            if stat_epoch.n > 0:
+                bpp_qe, psn_qe = stat_epoch.percentiles()
+                med_bpp  = float(bpp_qe[2]); min_bpp = float(bpp_qe[0]); max_bpp = float(bpp_qe[4]); q1_bpp = float(bpp_qe[1]); q3_bpp = float(bpp_qe[3])
+                med_psnr = float(psn_qe[2]); min_psnr = float(psn_qe[0]); max_psnr = float(psn_qe[4]); q1_psnr = float(psn_qe[1]); q3_psnr = float(psn_qe[3])
+                avg_msssim = float(stat_epoch.mss_sum / stat_epoch.n)
                 psnr_req_ep = float(env_cfg.min_psnr_db) if env_cfg.min_psnr_db is not None else float(med_psnr - env_cfg.psnr_margin_db)
                 mss_req_ep = float(env_cfg.min_msssim) if env_cfg.min_msssim is not None else float(env_cfg.msssim_floor)
-                pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(psnr_vals)))
+                pen_psnr_ep = max(0.0, psnr_req_ep - float(np.mean(stat_epoch.res.psnr)) if stat_epoch.res.psnr else 0.0)
                 pen_mss_ep = max(0.0, mss_req_ep - avg_msssim)
-                W_total = -(env_cfg._alpha_bpp * float(np.mean(bpp_vals)) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
+                W_total = -(env_cfg._alpha_bpp * float(stat_epoch.bpp_sum / stat_epoch.n) + env_cfg._alpha_psnr * pen_psnr_ep + env_cfg._alpha_msssim * pen_mss_ep)
                 print(
                     f"[RL] iter {it+1}/{iters}  "
                     f"bpp_med={med_bpp:.3f} (min={min_bpp:.3f}, q1={q1_bpp:.3f}, q3={q3_bpp:.3f}, max={max_bpp:.3f})  "
@@ -1357,7 +1416,6 @@ def train_rl(
                     f"TRAIN_epoch_elapsed={epoch_elapsed:.2f}s  "
                     f"alpha_bpp={env_cfg._alpha_bpp:.3f} alpha_psnr={env_cfg._alpha_psnr:.3f}"
                 )
-
                 vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters, shared_executor)
                 if vbpp is None or vpsnr is None:
                     stopper_flag, bpp_imp, db_imp = stopper.update(it, med_bpp, med_psnr)
@@ -1366,18 +1424,13 @@ def train_rl(
                     stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
                     tag = f"(val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
                 print(f"[RL] {tag}")
-
                 ckpt_dir = out_model.parent / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
                 trainer.save_torchscript(ckpt_path)
                 print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
-
                 if stopper_flag:
-                    print(
-                        f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs "
-                        f"(after warmup {early_cfg.start_after})."
-                    )
+                    print(f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs (after warmup {early_cfg.start_after}).")
                     trainer.save_torchscript(out_model)
                     print(f"[RL] saved TorchScript policy -> {out_model}")
                     malloc_trim()
@@ -1386,7 +1439,7 @@ def train_rl(
                 print(f"[RL] iter {it+1}/{iters}  (no metric-bearing steps this epoch)  TRAIN_epoch_elapsed={epoch_elapsed:.2f}s")
                 vbpp, vpsnr = _validate_epoch(trainer, env_cfg, loading_cfg, n_envs, ppo_cfg, val_paths, it, iters, shared_executor)
                 if vbpp is None or vpsnr is None:
-                    stopper_flag, bpp_imp, db_imp = stopper.update(it, float("inf"), float("-inf"))
+                    stopper_flag, bpp_imp, db_imp = stopper.update(it, float('inf'), float('-inf'))
                 else:
                     stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
                 print(f"[RL] (val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}")
