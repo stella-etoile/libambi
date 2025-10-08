@@ -1,3 +1,5 @@
+# highpsnr
+
 device: cpu
 
 encoder:
@@ -6,7 +8,7 @@ encoder:
   max_block: 128
   block_size: 16
   default_q: 12
-  default_K: 5
+  default_K: 6
   default_H: 8
   num_workers: 8
   chunk_size: 512
@@ -14,42 +16,41 @@ encoder:
   refine: {enabled: true, q: 0.02, grid: 4, max_mag: 4}
 
 policy:
-  target_bpp: 0.50
+  target_bpp: 0.60
 
-prior: {type: deterministic, K: 5}
+prior: {type: deterministic, K: 6}
 format: {magic: AMBI, version: 3}
 
 rl:
   control_split: true
-  progress_pct: 1
+  progress_pct: 2
 
   weights:
-    bpp_q1: 0.3
-    bpp_med: 0.7
-    bpp_q3: 1.2
+    alpha_bpp: 0.9
+    alpha_psnr: 1.8
+    alpha_msssim: 0.3
+    alpha_mismatch: 0.0
+    bpp_q1: 0.25
+    bpp_med: 0.60
+    bpp_q3: 1.10
     psnr_q1: 1.0
     psnr_med: 1.6
-    psnr_q3: 0.5
-    alpha_bpp: 1.0
-    alpha_psnr: 2.0
-    alpha_msssim: 0.5
-    alpha_mismatch: 0.5
+    psnr_q3: 0.6
 
   msssim_floor: 0.97
-  # psnr_margin_db: 0.5
-  min_psnr_db: 36
+  min_psnr_db: null
+  psnr_margin_db: 0.5
   min_msssim: null
-
   msssim_on: "y"
   ds_factor: 1.0
-  msssim_pow: 2.0
+  msssim_pow: 1.0
 
   split_bit_cost: 1.0
 
   loading:
     mode: lazy
     lazy_by: memory
-    mem_fraction: 0.85
+    mem_fraction: 0.80
     batch_size: 32
     iters_per_batch: 1
     aug_per_image: 3
@@ -60,6 +61,6 @@ rl:
   early_stop:
     enabled: true
     patience: 15
-    min_delta_bpp: 0.005
+    min_delta_bpp: 0.003
     min_delta_db: 0.02
-    start_after: 20
+    start_after: 10

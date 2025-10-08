@@ -1,9 +1,5 @@
 from __future__ import annotations
-import math, gc, os, time
-# os.environ.setdefault("OMP_NUM_THREADS","1")
-# os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
-# os.environ.setdefault("MKL_NUM_THREADS","1")
-# os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
+import math, gc, os, time, ctypes, random, pickle
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -25,8 +21,6 @@ from ambi.models import DeterministicPrior
 from ambi.partition import dynamic_quadtree_leaves
 from ambi.compress import choose_compressor, COMP_NONE, COMP_ZLIB
 from ambi.distortion import ssim, ms_ssim
-import ctypes
-import random
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -53,26 +47,6 @@ if os.environ.get("AMBI_NOPROGRESS", "") == "1":
         return _NoTqdm()
 else:
     from tqdm.auto import tqdm
-
-@dataclass
-class _Reservoir:
-    cap: int = 4096
-    bpp: list = None
-    psnr: list = None
-    mss: list = None
-    seen: int = 0
-    def __post_init__(self):
-        self.bpp = [] if self.bpp is None else self.bpp
-        self.psnr = [] if self.psnr is None else self.psnr
-        self.mss = [] if self.mss is None else self.mss
-    def add(self, b, p, m):
-        self.seen += 1
-        if len(self.bpp) < self.cap:
-            self.bpp.append(b); self.psnr.append(p); self.mss.append(m)
-        else:
-            j = random.randint(0, self.seen - 1)
-            if j < self.cap:
-                self.bpp[j] = b; self.psnr[j] = p; self.mss[j] = m
 
 @dataclass
 class _Reservoir:
@@ -147,7 +121,6 @@ class ProgressPrinter:
         self.start = time.perf_counter()
         self.next = self.step if self.step > 0 else 101.0
         self.enabled = self.step > 0
-
     def update(self, done: int):
         if not self.enabled:
             return
@@ -156,7 +129,6 @@ class ProgressPrinter:
             elapsed = time.perf_counter() - self.start
             print(f"[PROGRESS] {self.label} {self.next:.0f}% ({int(done)}/{self.total}) elapsed={elapsed:.2f}s")
             self.next += self.step
-
     def done(self, done: Optional[int] = None, reason: Optional[str] = None):
         if not self.enabled:
             return
@@ -302,7 +274,6 @@ class AMBIEnv:
             self.obs_dim = int(f0.size)
         else:
             self.obs_dim = int(cfg.obs_dim) if cfg.obs_dim is not None else 64
-
     def _pad_or_trunc(self, feat: np.ndarray) -> np.ndarray:
         feat = np.asarray(feat, dtype=np.float32).ravel()
         d = self.obs_dim
@@ -313,12 +284,10 @@ class AMBIEnv:
         out = np.zeros((d,), dtype=np.float32)
         out[:feat.size] = feat
         return out
-
     def _current_block(self) -> Optional[Tuple[int,int,int,int]]:
         if not self.stack:
             return None
         return self.stack[-1]
-
     def reset(self) -> np.ndarray:
         h, w, _ = self.ycc.shape
         if self.cfg.control_split:
@@ -334,14 +303,12 @@ class AMBIEnv:
             self.stack = deque(self._fixed_leaves[::-1])
         self.done_flag = (len(self.stack) == 0)
         return self._obs()
-
     def _obs(self) -> np.ndarray:
         if self.done_flag or not self.stack:
             return np.zeros((self.obs_dim,), np.float32)
         x, y, bw, bh = self.stack[-1]
         b = self.ycc[y:y+bh, x:x+bw, :]
         return self._pad_or_trunc(block_features(b))
-
     @staticmethod
     def _soft_qweight(x: float,
                       q1: float, med: float, q3: float,
@@ -365,7 +332,6 @@ class AMBIEnv:
             return float(w_med)
         s_q1 /= S; s_med /= S; s_q3 /= S
         return float(w_q1 * s_q1 + w_med * s_med + w_q3 * s_q3)
-    
     @staticmethod
     def _tri_memberships(x: float, q1: float, med: float, q3: float) -> Tuple[float, float, float]:
         eps = 1e-6
@@ -383,7 +349,6 @@ class AMBIEnv:
         if S <= eps:
             return 0.0, 1.0, 0.0
         return s_low / S, s_mid / S, s_high / S
-
     def _encode_reward(self, x, y, bw, bh, q, K, H) -> Tuple[float, Dict[str, float]]:
         b = self.ycc[y:y+bh, x:x+bw, :]
         qblk = quantize(b, q)
@@ -466,7 +431,6 @@ class AMBIEnv:
             "mss_req": mss_req
         }
         return reward, info
-
     def _split_reward(self, x, y, bw, bh) -> Tuple[float, Dict[str, float]]:
         bpp = float(self.cfg.split_bit_cost) / float(max(1, bw * bh))
         WBPP = float(getattr(self, "_WBPP", 1.0))
@@ -480,7 +444,6 @@ class AMBIEnv:
             "psnr": 120.0,
         }
         return reward, info
-
     def step(self, action) -> Tuple[np.ndarray, float, bool, Dict]:
         if self.done_flag or not self.stack:
             return self._obs(), 0.0, True, {}
@@ -537,7 +500,6 @@ class PolicyNet(nn.Module):
         self.pi_k = nn.Linear(hid, len(K_BINS))
         self.pi_h = nn.Linear(hid, len(H_BINS))
         self.v = nn.Linear(hid, 1)
-
     def forward(self, x: torch.Tensor):
         h = self.backbone(x)
         if self.control_split:
@@ -575,7 +537,6 @@ class PPOTrainer:
             torch.set_num_interop_threads(1)
         except Exception:
             pass
-
     def _gather(self, envs: List[AMBIEnv], steps: int, collect_stats: bool = True):
         obs_buf, act_buf, logp_buf, val_buf, rew_buf, done_buf = [], [], [], [], [], []
         n_envs = len(envs)
@@ -679,7 +640,6 @@ class PPOTrainer:
         ret = torch.as_tensor(ret, dtype=torch.float32, device=self.cfg.device)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         return obs, act, logp_old, adv, ret, stat
-
     def update(self, obs, act, logp_old, adv, ret):
         cfg = self.cfg
         n = obs.shape[0]
@@ -805,7 +765,6 @@ class PPOTrainer:
                         pp_mb.update(b_done)
                 epbar.update(1)
                 pp_mb.done()
-
     def save_torchscript(self, path: Path):
         self.net.eval()
         example = torch.randn(1, self.obs_dim, device=self.cfg.device, dtype=torch.float32)
@@ -853,7 +812,6 @@ class ImageBatcher:
         self.io_workers = int(os.environ.get("AMBI_IO_WORKERS", "8"))
         self._ext_executor = executor
         self.progress_pct = float(progress_pct)
-
         if cached_imgs is not None:
             self._cache = list(cached_imgs)
         elif self.mode.lower() == "eager":
@@ -877,11 +835,9 @@ class ImageBatcher:
             if len(imgs) > 1:
                 rng.shuffle(imgs)
             self._cache = imgs
-
     def __iter__(self):
         self._i = 0
         return self
-
     def __next__(self) -> List[np.ndarray]:
         if self._cache is not None:
             if self._i >= len(self._cache):
@@ -890,10 +846,8 @@ class ImageBatcher:
             batch = self._cache[self._i:j]
             self._i = j
             return batch
-
         if self._i >= len(self.paths):
             raise StopIteration
-
         if self.mode == "count":
             j = min(self._i + self.batch_size, len(self.paths))
             batch_paths = self.paths[self._i:j]
@@ -920,17 +874,14 @@ class ImageBatcher:
                 rng = np.random.default_rng(self.shuffle_seed)
                 rng.shuffle(imgs)
             return imgs
-
         avail0 = psutil.virtual_memory().available
         budget = max(128*1024*1024, int(avail0 * self.mem_fraction))
         imgs: List[np.ndarray] = []
         used = 0
-
         total = len(self.paths) - self._i
         pp = ProgressPrinter(max(1, total), self.progress_pct, "load (mem)")
         before_i = self._i
         loaded = 0
-
         while self._i < len(self.paths):
             p = self.paths[self._i]
             img = load_image_rgb(p)
@@ -941,7 +892,6 @@ class ImageBatcher:
             augs = make_augs(img, self.aug_kinds, self.aug_per_image)
             for a in augs:
                 need += int(a.nbytes)
-
             if used + need > budget or vm.available < soft_guard:
                 if len(imgs) == 0:
                     imgs.append(img)
@@ -949,22 +899,18 @@ class ImageBatcher:
                     self._i += 1
                     loaded += 1
                 break
-
             imgs.append(img)
             imgs.extend(augs)
             used += need
             self._i += 1
             loaded += 1
             pp.update(loaded)
-
         if not imgs:
             pp.done(loaded, reason="no images fit")
             raise StopIteration
-
         if len(imgs) > 1:
             rng = np.random.default_rng(self.shuffle_seed)
             rng.shuffle(imgs)
-
         pp.done(loaded, reason="batch memory limit")
         return imgs
 
@@ -1021,7 +967,6 @@ class EarlyStopper:
         self.best_bpp = float("inf")
         self.best_db = float("-inf")
         self.wait = 0
-
     def update(self, epoch_idx: int, bpp: float, db: float):
         if not self.cfg.enabled or epoch_idx < self.cfg.start_after:
             if bpp < self.best_bpp: self.best_bpp = bpp
@@ -1160,6 +1105,113 @@ def _validate_epoch(trainer: PPOTrainer, env_cfg: EnvCfg, loading_cfg: LoadingCf
         trainer.net.train()
         return None, None
 
+def _rng_capture():
+    d = {}
+    try:
+        d["py"] = random.getstate()
+    except Exception:
+        d["py"] = None
+    try:
+        d["np"] = np.random.get_state()
+    except Exception:
+        d["np"] = None
+    try:
+        d["torch_cpu"] = torch.get_rng_state()
+    except Exception:
+        d["torch_cpu"] = None
+    try:
+        if torch.cuda.is_available():
+            d["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+        else:
+            d["torch_cuda_all"] = None
+    except Exception:
+        d["torch_cuda_all"] = None
+    return d
+
+def _rng_restore(d):
+    try:
+        if d.get("py", None) is not None:
+            random.setstate(d["py"])
+    except Exception:
+        pass
+    try:
+        if d.get("np", None) is not None:
+            np.random.set_state(d["np"])
+    except Exception:
+        pass
+    try:
+        if d.get("torch_cpu", None) is not None:
+            torch.set_rng_state(d["torch_cpu"])
+    except Exception:
+        pass
+    try:
+        if d.get("torch_cuda_all", None) is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(d["torch_cuda_all"])
+    except Exception:
+        pass
+
+def _save_checkpoint(path: Path,
+                     trainer: PPOTrainer,
+                     it: int,
+                     env_cfg: EnvCfg,
+                     ppo_cfg: PPOCfg,
+                     loading_cfg: LoadingCfg,
+                     yaml_cfg: Dict[str, Any],
+                     stopper: EarlyStopper,
+                     extra: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        "it": int(it),
+        "model": trainer.net.state_dict(),
+        "optimizer": trainer.opt.state_dict(),
+        "scaler": trainer.scaler.state_dict() if isinstance(trainer.scaler, torch.cuda.amp.GradScaler) else None,
+        "env_cfg": env_cfg.__dict__,
+        "ppo_cfg": ppo_cfg.__dict__,
+        "loading_cfg": loading_cfg.__dict__,
+        "yaml_cfg": yaml_cfg,
+        "stopper": {"best_bpp": stopper.best_bpp, "best_db": stopper.best_db, "wait": stopper.wait, "cfg": stopper.cfg.__dict__},
+        "alphas": {"alpha_bpp": getattr(env_cfg, "_alpha_bpp", 1.0), "alpha_psnr": getattr(env_cfg, "_alpha_psnr", 1.0), "alpha_msssim": getattr(env_cfg, "_alpha_msssim", 1.0)},
+        "cuts": {"bpp_cuts": getattr(env_cfg, "_bpp_cuts", None), "psnr_cuts": getattr(env_cfg, "_psnr_cuts", None)},
+        "rng": _rng_capture(),
+        "extra": extra,
+        "control_split": trainer.control_split,
+        "obs_dim": trainer.obs_dim,
+        "device": trainer.cfg.device,
+    }
+    torch.save(ckpt, str(path))
+
+def _load_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        ckpt = torch.load(str(path), map_location="cpu")
+        return ckpt
+    except Exception:
+        return None
+
+def _apply_checkpoint(ckpt: Dict[str, Any],
+                      trainer: PPOTrainer,
+                      stopper: EarlyStopper,
+                      env_cfg: EnvCfg) -> int:
+    trainer.net.load_state_dict(ckpt["model"])
+    trainer.opt.load_state_dict(ckpt["optimizer"])
+    if ckpt.get("scaler", None) is not None and isinstance(trainer.scaler, torch.cuda.amp.GradScaler):
+        trainer.scaler.load_state_dict(ckpt["scaler"])
+    alphas = ckpt.get("alphas", {})
+    setattr(env_cfg, "_alpha_bpp", float(alphas.get("alpha_bpp", getattr(env_cfg, "_alpha_bpp", 1.0))))
+    setattr(env_cfg, "_alpha_psnr", float(alphas.get("alpha_psnr", getattr(env_cfg, "_alpha_psnr", 1.0))))
+    setattr(env_cfg, "_alpha_msssim", float(alphas.get("alpha_msssim", getattr(env_cfg, "_alpha_msssim", 1.0))))
+    cuts = ckpt.get("cuts", {})
+    setattr(env_cfg, "_bpp_cuts", cuts.get("bpp_cuts", getattr(env_cfg, "_bpp_cuts", None)))
+    setattr(env_cfg, "_psnr_cuts", cuts.get("psnr_cuts", getattr(env_cfg, "_psnr_cuts", None)))
+    st = ckpt.get("stopper", {})
+    stopper.best_bpp = float(st.get("best_bpp", stopper.best_bpp))
+    stopper.best_db = float(st.get("best_db", stopper.best_db))
+    stopper.wait = int(st.get("wait", stopper.wait))
+    _rng_restore(ckpt.get("rng", {}))
+    it = int(ckpt.get("it", 0))
+    return it
+
 def train_rl(
     data_root: Path,
     out_model: Path,
@@ -1167,6 +1219,8 @@ def train_rl(
     ppo_cfg: PPOCfg = PPOCfg(),
     n_envs: int = 4,
     iters: int = 10,
+    resume: bool = True,
+    resume_path: Optional[Path] = None,
 ) -> None:
     enc = yaml_cfg.get("encoder", {}) if yaml_cfg else {}
     fmt = yaml_cfg.get("format", {}) if yaml_cfg else {}
@@ -1213,13 +1267,11 @@ def train_rl(
     progress_pct = float(rl.get("progress_pct", 0.0))
     WBPP  = bpp_q1 + bpp_med + bpp_q3
     WPSNR = psnr_q1 + psnr_med + psnr_q3
-
     paths = list_image_paths(data_root)
     if not paths:
         raise ValueError("No images found for RL dataset.")
     probe_img = load_image_rgb(paths[0])
     env_probe = AMBIEnv(probe_img, env_cfg)
-
     setattr(env_cfg, "_WBPP", WBPP)
     setattr(env_cfg, "_WPSNR", WPSNR)
     setattr(env_cfg, "_alpha_bpp", alpha_bpp_base)
@@ -1228,16 +1280,13 @@ def train_rl(
     setattr(env_cfg, "_alpha_mismatch", alpha_mismatch)
     setattr(env_cfg, "_bpp_weights", (bpp_q1, bpp_med, bpp_q3))
     setattr(env_cfg, "_psnr_weights", (psnr_q1, psnr_med, psnr_q3))
-
     obs_dim = int(env_probe.obs_dim)
     trainer = PPOTrainer(obs_dim, ppo_cfg, control_split=env_cfg.control_split, progress_pct=progress_pct)
-
     try:
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
     except Exception:
         pass
-
     loading_cfg = LoadingCfg(
         mode=str(rl.get("loading", {}).get("mode", "eager")),
         lazy_by=str(rl.get("loading", {}).get("lazy_by", "count")),
@@ -1249,7 +1298,6 @@ def train_rl(
         shuffle_seed=int(rl.get("loading", {}).get("shuffle_seed", 0)),
         io_workers=int(rl.get("loading", {}).get("io_workers", 8)),
     )
-
     es_raw = (yaml_cfg.get("rl", {}) or {}).get("early_stop", {}) if yaml_cfg else {}
     early_cfg = EarlyStopCfg(
         enabled=bool(es_raw.get("enabled", False)),
@@ -1259,17 +1307,26 @@ def train_rl(
         start_after=int(es_raw.get("start_after", 0)),
     )
     stopper = EarlyStopper(early_cfg)
-
     alpha_bpp_cur = float(alpha_bpp_base)
     alpha_psnr_cur = float(alpha_psnr_base)
     env_cfg._alpha_bpp = alpha_bpp_cur
     env_cfg._alpha_psnr = alpha_psnr_cur
-
     use_eager = loading_cfg.mode.lower() == "eager"
     keep_cache = bool(rl.get("loading", {}).get("keep_cache", True))
     cached_imgs: Optional[List[np.ndarray]] = None
     shared_executor = ThreadPoolExecutor(max_workers=loading_cfg.io_workers)
-
+    ckpt_dir = out_model.parent / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    state_path = resume_path if resume_path is not None else (out_model.parent / "state.pt")
+    start_it = 0
+    if resume:
+        ckpt = _load_checkpoint(state_path)
+        if ckpt is not None:
+            print(f"[RL] resuming from {state_path}")
+            start_it = _apply_checkpoint(ckpt, trainer, stopper, env_cfg)
+            start_it = max(0, min(start_it, iters))
+        else:
+            print(f"[RL] no resume state at {state_path}")
     try:
         if use_eager and keep_cache:
             cached_imgs = preload_all_images(
@@ -1279,16 +1336,13 @@ def train_rl(
                 seed=loading_cfg.shuffle_seed,
                 io_workers=loading_cfg.io_workers,
                 executor=shared_executor,
-                progress_pct=progress_pct,  # NEW
+                progress_pct=progress_pct,
             )
-
-        val_root = Path("/mnt/Jupiter/dataset/ambi/clic2024_split/val_7306")
+        val_root = Path(rl.get("val_root", "/mnt/Jupiter/dataset/ambi/clic2024_split/val_7306"))
         val_paths = list_image_paths(val_root)
-
-        for it in range(iters):
+        for it in range(start_it, iters):
             epoch_start = time.perf_counter()
             stat_epoch = _StatPack()
-
             if use_eager and keep_cache and cached_imgs is not None:
                 batcher = ImageBatcher(
                     paths=[],
@@ -1340,20 +1394,16 @@ def train_rl(
                     budget0 = max(128 * 1024 * 1024, int(vm0.available * loading_cfg.mem_fraction))
                     est_units_per_batch0 = max(1, int(budget0 // max(1, int(est_bytes_per_unit))))
                     num_batches = max(1, math.ceil(len(paths) / est_units_per_batch0))
-
             pp_train = ProgressPrinter(num_batches, progress_pct, f"train epoch {it+1}")
             batch_idx = 0
-
             for imgs in batcher:
                 batch_idx += 1
                 batch_start = time.perf_counter()
                 approx_tag = "" if (use_eager and keep_cache and cached_imgs is not None) or batcher.mode == "count" else "~"
                 print(f"[Epoch {it+1}/{iters}] Batch {batch_idx}/{approx_tag}{num_batches}")
-
                 envs = build_envs(imgs, env_cfg, n_envs, env_workers=loading_cfg.io_workers)
                 stat_batch = _StatPack()
                 inner = max(1, loading_cfg.iters_per_batch)
-
                 for _ in range(inner):
                     obs, act, logp_old, adv, ret, stat_roll = trainer._gather(envs, ppo_cfg.steps_per_iter, collect_stats=True)
                     if stat_roll and stat_roll.n > 0:
@@ -1365,7 +1415,6 @@ def train_rl(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     malloc_trim()
-
                 if stat_batch.n > 0:
                     bpp_q, psn_q = stat_batch.percentiles()
                     avg_msssim_b = float(stat_batch.mss_sum / stat_batch.n)
@@ -1382,21 +1431,16 @@ def train_rl(
                     )
                     env_cfg._bpp_cuts = (float(bpp_q[1]), float(bpp_q[2]), float(bpp_q[3]))
                     env_cfg._psnr_cuts = (float(psn_q[1]), float(psn_q[2]), float(psn_q[3]))
-
-
                 batch_elapsed = time.perf_counter() - batch_start
                 print(f"[Epoch {it+1}/{iters}] TRAIN-BATCH {batch_idx} elapsed={batch_elapsed:.2f}s")
                 pp_train.update(batch_idx)
-
                 del envs, imgs
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 malloc_trim()
-
             pp_train.done()
             epoch_elapsed = time.perf_counter() - epoch_start
-
             if stat_epoch.n > 0:
                 bpp_qe, psn_qe = stat_epoch.percentiles()
                 med_bpp  = float(bpp_qe[2]); min_bpp = float(bpp_qe[0]); max_bpp = float(bpp_qe[4]); q1_bpp = float(bpp_qe[1]); q3_bpp = float(bpp_qe[3])
@@ -1424,11 +1468,10 @@ def train_rl(
                     stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
                     tag = f"(val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}"
                 print(f"[RL] {tag}")
-                ckpt_dir = out_model.parent / "checkpoints"
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
                 ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
                 trainer.save_torchscript(ckpt_path)
                 print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+                _save_checkpoint(state_path, trainer, it+1, env_cfg, ppo_cfg, loading_cfg, yaml_cfg, stopper, {"last_epoch_elapsed": epoch_elapsed})
                 if stopper_flag:
                     print(f"[RL] early stop: no validation improvement for {early_cfg.patience} epochs (after warmup {early_cfg.start_after}).")
                     trainer.save_torchscript(out_model)
@@ -1443,17 +1486,14 @@ def train_rl(
                 else:
                     stopper_flag, bpp_imp, db_imp = stopper.update(it, vbpp, vpsnr)
                 print(f"[RL] (val-based) improved: val_bpp_med={bpp_imp}, val_psnr_med={db_imp}, wait={stopper.wait}/{early_cfg.patience}")
-                ckpt_dir = out_model.parent / "checkpoints"
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
                 ckpt_path = ckpt_dir / f"{out_model.stem}_epoch{it+1:03d}.ts"
                 trainer.save_torchscript(ckpt_path)
                 print(f"[RL] saved epoch checkpoint -> {ckpt_path}")
+                _save_checkpoint(state_path, trainer, it+1, env_cfg, ppo_cfg, loading_cfg, yaml_cfg, stopper, {"last_epoch_elapsed": epoch_elapsed})
                 malloc_trim()
-
         trainer.save_torchscript(out_model)
         print(f"[RL] saved TorchScript policy -> {out_model}")
         malloc_trim()
-
     finally:
         try:
             shared_executor.shutdown(wait=True)
